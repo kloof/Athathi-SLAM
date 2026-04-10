@@ -1,0 +1,17 @@
+calibration_date: '2026-04-11T00:26:17+03:00'
+child_frame: camera_optical_frame
+method: checkerboard_3_captures
+parent_frame: unilidar_lidar
+rotation:
+  w: 0.9966643097929749
+  x: 0.0024309184004324153
+  y: -0.08154816792336875
+  z: 0.0020592544683461582
+rpy_degrees:
+  pitch: -9.355653195170849
+  roll: 0.26187463257089105
+  yaw: 0.2153345868638476
+translation:
+  x: -0.2121463886626117
+  y: -0.0556712037028712
+  z: 0.7973055587982762
