@@ -1,0 +1,6 @@
+__pycache__/
+recordings/
+*.ply
+sessions.json
+image.png
+.claude/

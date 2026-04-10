@@ -1,0 +1,593 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>LiDAR SLAM Recorder</title>
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; -webkit-tap-highlight-color: transparent; }
+        html { font-size: 14px; }
+        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #1a1a2e; color: #eee; padding: 8px; margin: 0; overflow-x: hidden; }
+        h1 { font-size: 1.2em; margin-bottom: 8px; color: #e94560; }
+        h2 { font-size: 1em; margin-bottom: 0; color: #0f3460; background: #e94560; padding: 6px 10px; border-radius: 6px 6px 0 0; }
+
+        .card { background: #16213e; border-radius: 6px; margin-bottom: 8px; overflow: hidden; }
+        .card-body { padding: 8px; }
+
+        .status-row { display: flex; justify-content: space-between; padding: 4px 0; border-bottom: 1px solid #1a1a2e; }
+        .status-row:last-child { border: none; }
+        .status-label { color: #888; }
+        .status-value { font-weight: 600; }
+        .ok { color: #4ecca3; }
+        .warn { color: #f0a500; }
+        .err { color: #e94560; }
+
+        /* Touch-friendly buttons: min 44px tap target */
+        .btn { display: inline-block; padding: 14px 24px; border: none; border-radius: 8px; font-size: 1em; font-weight: 600; cursor: pointer; transition: opacity 0.2s; width: 100%; margin-bottom: 6px; min-height: 48px; }
+        .btn:disabled { opacity: 0.4; }
+        .btn:active { opacity: 0.7; }
+        .btn-record { background: #e94560; color: #fff; }
+        .btn-stop { background: #f0a500; color: #1a1a2e; }
+        .btn-delete { background: none; color: #e94560; border: 1px solid #e94560; font-size: 0.85em; padding: 8px 14px; width: auto; margin: 0; min-height: 40px; }
+        .btn-process { background: #4ecca3; color: #1a1a2e; font-size: 0.85em; padding: 8px 14px; width: auto; margin: 0; border: none; border-radius: 6px; font-weight: 600; cursor: pointer; min-height: 40px; }
+        .btn-process:disabled { opacity: 0.4; }
+        .btn-download { background: #0f3460; color: #eee; font-size: 0.85em; padding: 8px 14px; width: auto; margin: 0; border: none; border-radius: 6px; font-weight: 600; cursor: pointer; text-decoration: none; display: inline-block; min-height: 40px; }
+
+        .slam-result { font-size: 0.8em; color: #4ecca3; margin-top: 4px; padding: 6px; background: #1a1a2e; border-radius: 4px; display: flex; flex-wrap: wrap; gap: 6px; }
+        .slam-result span { margin-right: 0; }
+        .slam-progress { font-size: 0.85em; color: #f0a500; margin-top: 4px; }
+        .slam-error { font-size: 0.85em; color: #e94560; margin-top: 4px; }
+
+        .floorplan-container { margin-top: 8px; padding: 8px; background: #1a1a2e; border-radius: 6px; }
+        .floorplan-container img { width: 100%; border-radius: 4px; margin-top: 4px; }
+        .floorplan-meta { font-size: 0.8em; color: #4ecca3; display: flex; flex-wrap: wrap; gap: 8px; }
+        .floorplan-status { font-size: 0.85em; color: #f0a500; margin-top: 4px; }
+        .btn-floorplan { background: #0f3460; color: #eee; font-size: 0.9em; padding: 12px 14px; width: auto; margin: 0; border: none; border-radius: 8px; font-weight: 600; cursor: pointer; min-height: 44px; }
+        .btn-floorplan:active { opacity: 0.7; }
+        .btn-floorplan.primary { background: #4ecca3; color: #1a1a2e; }
+
+        .candidates-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 8px; margin-top: 8px; }
+        .candidate-card { background: #16213e; border-radius: 6px; padding: 6px; cursor: pointer; border: 3px solid transparent; transition: border-color 0.15s; min-height: 44px; }
+        .candidate-card:active { border-color: #4ecca3; background: #1a2a4e; }
+        .candidate-card img { width: 100%; border-radius: 4px; }
+        .candidate-dims { font-size: 1.1em; color: #4ecca3; font-weight: 700; text-align: center; margin-top: 4px; }
+        .candidate-detail { font-size: 0.85em; color: #888; text-align: center; margin-top: 2px; }
+        .candidates-title { font-size: 0.85em; color: #f0a500; margin-bottom: 6px; font-weight: 600; }
+
+        .ortho-toggle { display: flex; align-items: center; gap: 8px; margin-top: 8px; font-size: 0.85em; color: #888; min-height: 40px; }
+        .ortho-toggle input { accent-color: #4ecca3; width: 20px; height: 20px; }
+
+        .voxel-select { background: #1a1a2e; color: #eee; border: 1px solid #0f3460; border-radius: 4px; padding: 6px 8px; font-size: 0.85em; margin-right: 6px; min-height: 36px; }
+
+        .recording-indicator { display: flex; align-items: center; gap: 8px; padding: 10px; background: #e94560; border-radius: 6px; margin-bottom: 8px; font-weight: 600; }
+        .recording-dot { width: 12px; height: 12px; background: #fff; border-radius: 50%; animation: blink 1s infinite; }
+        @keyframes blink { 0%, 100% { opacity: 1; } 50% { opacity: 0.3; } }
+
+        .session-item { padding: 8px; border-bottom: 1px solid #1a1a2e; }
+        .session-item:last-child { border: none; }
+        .session-header { display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 6px; }
+        .session-name-text { font-weight: 600; color: #4ecca3; font-size: 0.95em; }
+        .session-meta { font-size: 0.75em; color: #888; margin-top: 2px; }
+        .session-scp { font-size: 0.7em; color: #666; margin-top: 2px; font-family: monospace; word-break: break-all; }
+        .empty { color: #666; padding: 16px; text-align: center; }
+        .timer { font-size: 1.4em; font-variant-numeric: tabular-nums; }
+
+        .session-name { display: block; width: 100%; padding: 10px; border: 1px solid #0f3460; border-radius: 6px; background: #1a1a2e; color: #eee; font-size: 1em; margin-bottom: 6px; }
+    </style>
+</head>
+<body>
+    <h1>LiDAR SLAM Recorder</h1>
+
+    <!-- Status Card -->
+    <div class="card">
+        <h2>System Status</h2>
+        <div class="card-body" id="status-panel">
+            <div class="status-row">
+                <span class="status-label">Network</span>
+                <span class="status-value" id="s-network">checking...</span>
+            </div>
+            <div class="status-row">
+                <span class="status-label">LiDAR</span>
+                <span class="status-value" id="s-lidar">checking...</span>
+            </div>
+            <div class="status-row">
+                <span class="status-label">State</span>
+                <span class="status-value" id="s-state">idle</span>
+            </div>
+        </div>
+    </div>
+
+    <!-- Recording Card -->
+    <div class="card">
+        <h2>Record</h2>
+        <div class="card-body">
+            <div id="recording-banner" style="display:none">
+                <div class="recording-indicator">
+                    <div class="recording-dot"></div>
+                    <span>Recording</span>
+                    <span class="timer" id="rec-timer">0:00</span>
+                </div>
+            </div>
+            <input type="text" class="session-name" id="session-name"
+                   placeholder="Session name (optional)">
+            <button class="btn btn-record" id="btn-start" onclick="startRecording()">
+                Start Recording
+            </button>
+            <button class="btn btn-stop" id="btn-stop" onclick="stopRecording()" style="display:none">
+                Stop Recording
+            </button>
+        </div>
+    </div>
+
+    <!-- Sessions Card -->
+    <div class="card">
+        <h2>Sessions</h2>
+        <div class="card-body" id="sessions-list">
+            <div class="empty">No recordings yet</div>
+        </div>
+    </div>
+
+    <script>
+        let evtSource = null;
+        let isRecording = false;
+        let processingStates = {};
+
+        // --- SSE ---
+        function connectSSE() {
+            if (evtSource) evtSource.close();
+            evtSource = new EventSource('/api/events');
+            evtSource.onmessage = (e) => {
+                const d = JSON.parse(e.data);
+                updateRecordingUI(d);
+                updateProcessingUI(d.processing || {});
+            };
+            evtSource.onerror = () => {
+                setTimeout(connectSSE, 3000);
+            };
+        }
+
+        function updateProcessingUI(processing) {
+            const wasProcessing = Object.keys(processingStates);
+            const nowProcessing = Object.keys(processing);
+            let needRefresh = false;
+
+            // Refresh if something finished or changed status type
+            for (const sid of wasProcessing) {
+                if (!nowProcessing.includes(sid)) {
+                    needRefresh = true;
+                } else if (processingStates[sid].status !== processing[sid].status) {
+                    needRefresh = true;
+                }
+            }
+
+            processingStates = processing;
+            if (needRefresh) loadSessions();
+
+            // Update progress displays
+            for (const [sid, info] of Object.entries(processing)) {
+                const prefix = info.status === 'floorplan' ? 'fp-progress' : 'slam-progress';
+                const el = document.getElementById(`${prefix}-${sid}`);
+                if (el) {
+                    const mins = Math.floor(info.elapsed / 60);
+                    const secs = Math.floor(info.elapsed % 60);
+                    const label = info.status === 'floorplan' ? 'Floor plan: ' : '';
+                    el.textContent = `${label}${info.progress} (${mins}:${secs.toString().padStart(2, '0')})`;
+                }
+            }
+        }
+
+        function updateRecordingUI(d) {
+            const banner = document.getElementById('recording-banner');
+            const btnStart = document.getElementById('btn-start');
+            const btnStop = document.getElementById('btn-stop');
+            const nameInput = document.getElementById('session-name');
+            const timer = document.getElementById('rec-timer');
+            const stateEl = document.getElementById('s-state');
+
+            if (d.recording) {
+                isRecording = true;
+                banner.style.display = 'block';
+                btnStart.style.display = 'none';
+                btnStop.style.display = 'block';
+                nameInput.disabled = true;
+                const mins = Math.floor(d.elapsed / 60);
+                const secs = Math.floor(d.elapsed % 60);
+                timer.textContent = `${mins}:${secs.toString().padStart(2, '0')}`;
+                stateEl.textContent = d.status || 'recording';
+                stateEl.className = 'status-value warn';
+            } else {
+                if (isRecording) {
+                    isRecording = false;
+                    loadSessions();
+                }
+                banner.style.display = 'none';
+                btnStart.style.display = 'block';
+                btnStop.style.display = 'none';
+                nameInput.disabled = false;
+                stateEl.textContent = 'idle';
+                stateEl.className = 'status-value ok';
+            }
+        }
+
+        // --- API calls ---
+        async function checkStatus() {
+            try {
+                const res = await fetch('/api/status');
+                const d = await res.json();
+
+                const netEl = document.getElementById('s-network');
+                netEl.textContent = d.network.ok ? 'OK' : 'Error';
+                netEl.className = 'status-value ' + (d.network.ok ? 'ok' : 'err');
+
+                const lidarEl = document.getElementById('s-lidar');
+                lidarEl.textContent = d.lidar_reachable ? 'Connected' : 'Not reachable';
+                lidarEl.className = 'status-value ' + (d.lidar_reachable ? 'ok' : 'warn');
+            } catch (e) {
+                document.getElementById('s-network').textContent = 'Fetch error';
+            }
+        }
+
+        async function startRecording() {
+            const name = document.getElementById('session-name').value.trim() || undefined;
+            const btnStart = document.getElementById('btn-start');
+            btnStart.disabled = true;
+
+            try {
+                const res = await fetch('/api/record/start', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({name}),
+                });
+                const d = await res.json();
+                if (!res.ok) {
+                    alert(d.error || 'Failed to start');
+                    btnStart.disabled = false;
+                }
+            } catch (e) {
+                alert('Network error: ' + e.message);
+                btnStart.disabled = false;
+            }
+        }
+
+        async function stopRecording() {
+            const btnStop = document.getElementById('btn-stop');
+            btnStop.disabled = true;
+
+            try {
+                const res = await fetch('/api/record/stop', {method: 'POST'});
+                const d = await res.json();
+                if (!res.ok) alert(d.error || 'Failed to stop');
+                loadSessions();
+            } catch (e) {
+                alert('Network error: ' + e.message);
+            } finally {
+                btnStop.disabled = false;
+            }
+        }
+
+        async function processSession(id) {
+            const voxelSelect = document.getElementById(`voxel-${id}`);
+            const voxelSize = voxelSelect ? voxelSelect.value : null;
+            const btn = document.getElementById(`btn-process-${id}`);
+            if (btn) btn.disabled = true;
+
+            try {
+                const body = {};
+                if (voxelSize) body.voxel_size = parseFloat(voxelSize);
+                const res = await fetch(`/api/session/${id}/process`, {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify(body),
+                });
+                const d = await res.json();
+                if (!res.ok) {
+                    alert(d.error || 'Failed to start processing');
+                    if (btn) btn.disabled = false;
+                }
+                loadSessions();
+            } catch (e) {
+                alert('Network error: ' + e.message);
+                if (btn) btn.disabled = false;
+            }
+        }
+
+        async function detectWalls(id) {
+            const orthoEl = document.getElementById(`ortho-${id}`);
+            const orthoTol = (orthoEl && orthoEl.checked) ? 15 : 0;
+            try {
+                const res = await fetch(`/api/session/${id}/floorplan/detect`, {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({ortho_tol: orthoTol}),
+                });
+                const d = await res.json();
+                if (!res.ok) alert(d.error || 'Failed to start');
+                loadSessions();
+            } catch (e) {
+                alert('Network error: ' + e.message);
+            }
+        }
+
+        async function pickCandidate(sessionId, candidateId) {
+            try {
+                const res = await fetch(`/api/session/${sessionId}/floorplan/pick`, {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({candidate_id: candidateId}),
+                });
+                const d = await res.json();
+                if (!res.ok) alert(d.error || 'Failed to pick candidate');
+                loadSessions();
+            } catch (e) {
+                alert('Network error: ' + e.message);
+            }
+        }
+
+        async function deleteSession(id) {
+            if (!confirm('Delete this recording?')) return;
+            try {
+                await fetch(`/api/session/${id}`, {method: 'DELETE'});
+                loadSessions();
+            } catch (e) {
+                alert('Failed to delete');
+            }
+        }
+
+        async function loadSessions() {
+            try {
+                const res = await fetch('/api/sessions');
+                const sessions = await res.json();
+                const container = document.getElementById('sessions-list');
+
+                if (!sessions.length) {
+                    container.innerHTML = '<div class="empty">No recordings yet</div>';
+                    return;
+                }
+
+                container.innerHTML = '';
+                sessions.forEach(s => {
+                    const item = document.createElement('div');
+                    item.className = 'session-item';
+
+                    const header = document.createElement('div');
+                    header.className = 'session-header';
+                    header.style.gap = '8px';
+                    const nameSpan = document.createElement('span');
+                    nameSpan.className = 'session-name-text';
+                    nameSpan.textContent = s.name;
+
+                    const btnGroup = document.createElement('div');
+                    btnGroup.style.display = 'flex';
+                    btnGroup.style.gap = '6px';
+                    btnGroup.style.alignItems = 'center';
+
+                    // Process button (show if stopped/no slam result and not currently processing)
+                    const procInfo = processingStates[s.id];
+                    const isSlamProcessing = (procInfo && procInfo.status !== 'floorplan') || s.slam_status === 'compressing' || s.slam_status === 'uploading';
+                    const canProcess = (s.status === 'stopped' || s.status === 'processed') && !isSlamProcessing && s.bag_size;
+
+                    if (canProcess && !s.slam_result) {
+                        const voxelSelect = document.createElement('select');
+                        voxelSelect.className = 'voxel-select';
+                        voxelSelect.id = `voxel-${s.id}`;
+                        voxelSelect.innerHTML = '<option value="0.005">5mm</option><option value="0.01">10mm</option><option value="0.02" selected>20mm</option>';
+                        btnGroup.appendChild(voxelSelect);
+
+                        const procBtn = document.createElement('button');
+                        procBtn.className = 'btn-process';
+                        procBtn.id = `btn-process-${s.id}`;
+                        procBtn.textContent = 'Process';
+                        procBtn.onclick = () => processSession(s.id);
+                        btnGroup.appendChild(procBtn);
+                    }
+
+                    // Download button if we have results
+                    if (s.slam_result && s.slam_result.download_url) {
+                        const dlBtn = document.createElement('a');
+                        dlBtn.className = 'btn-download';
+                        dlBtn.href = `/api/session/${s.id}/download`;
+                        dlBtn.textContent = 'Download PLY';
+                        btnGroup.appendChild(dlBtn);
+
+                        // Re-process button
+                        const reBtn = document.createElement('button');
+                        reBtn.className = 'btn-process';
+                        reBtn.id = `btn-process-${s.id}`;
+                        reBtn.textContent = 'Re-process';
+                        reBtn.onclick = () => processSession(s.id);
+                        btnGroup.appendChild(reBtn);
+                    }
+
+                    const delBtn = document.createElement('button');
+                    delBtn.className = 'btn btn-delete';
+                    delBtn.textContent = 'Delete';
+                    delBtn.onclick = () => deleteSession(s.id);
+                    btnGroup.appendChild(delBtn);
+
+                    header.appendChild(nameSpan);
+                    header.appendChild(btnGroup);
+
+                    const meta = document.createElement('div');
+                    meta.className = 'session-meta';
+                    const created = s.created ? new Date(s.created).toLocaleString() : '';
+                    const dur = s.duration ? s.duration + 's' : '';
+                    const size = s.bag_size || 'no data';
+                    meta.innerHTML = `${created} | ${dur} | ${size} | <span class="${s.status === 'error' ? 'err' : 'ok'}">${s.status}</span>`;
+
+                    const scp = document.createElement('div');
+                    scp.className = 'session-scp';
+                    scp.textContent = `scp -r talal@${location.hostname}:${s.scp_path} .`;
+
+                    item.appendChild(header);
+                    item.appendChild(meta);
+                    item.appendChild(scp);
+
+                    // SLAM processing progress
+                    if (isSlamProcessing) {
+                        const prog = document.createElement('div');
+                        prog.className = 'slam-progress';
+                        prog.id = `slam-progress-${s.id}`;
+                        prog.textContent = procInfo ? `${procInfo.progress} (${Math.floor(procInfo.elapsed/60)}:${Math.floor(procInfo.elapsed%60).toString().padStart(2,'0')})` : 'Processing...';
+                        item.appendChild(prog);
+                    }
+
+                    // SLAM results
+                    if (s.slam_result) {
+                        const res = document.createElement('div');
+                        res.className = 'slam-result';
+                        res.innerHTML = `<span>${Number(s.slam_result.num_points).toLocaleString()} points</span>`
+                            + `<span>${s.slam_result.bounding_box}</span>`
+                            + `<span>SLAM: ${s.slam_result.slam_time}s</span>`
+                            + `<span>Total: ${s.slam_result.total_time}s</span>`;
+                        item.appendChild(res);
+                    }
+
+                    // SLAM error
+                    if (s.slam_error && !s.slam_result) {
+                        const errDiv = document.createElement('div');
+                        errDiv.className = 'slam-error';
+                        errDiv.textContent = `Processing error: ${s.slam_error}`;
+                        item.appendChild(errDiv);
+                    }
+
+                    // Floor plan section
+                    const fpStatus = s.floorplan_status;
+                    const fpProcessing = procInfo && procInfo.status === 'floorplan';
+
+                    if (fpProcessing || (fpStatus && fpStatus !== 'done' && fpStatus !== 'error' && fpStatus !== 'candidates_ready')) {
+                        // Floor plan in progress
+                        const fpProg = document.createElement('div');
+                        fpProg.className = 'floorplan-status';
+                        fpProg.id = `fp-progress-${s.id}`;
+                        if (procInfo && procInfo.status === 'floorplan') {
+                            const mins = Math.floor(procInfo.elapsed / 60);
+                            const secs = Math.floor(procInfo.elapsed % 60);
+                            fpProg.textContent = `Floor plan: ${procInfo.progress} (${mins}:${secs.toString().padStart(2,'0')})`;
+                        } else {
+                            fpProg.textContent = `Floor plan: ${fpStatus}...`;
+                        }
+                        item.appendChild(fpProg);
+                    }
+
+                    if (fpStatus === 'done' && s.floorplan_meta) {
+                        const fpDiv = document.createElement('div');
+                        fpDiv.className = 'floorplan-container';
+
+                        const fpMeta = document.createElement('div');
+                        fpMeta.className = 'floorplan-meta';
+                        const m = s.floorplan_meta;
+                        const wallLens = m.wall_lengths ? m.wall_lengths.map(w => w.toFixed(2) + 'm').join(', ') : '';
+                        fpMeta.innerHTML = `<span>${m.num_walls} walls</span>`
+                            + `<span>Area: ${m.area_m2}m&sup2;</span>`
+                            + `<span>Walls: ${wallLens}</span>`;
+                        fpDiv.appendChild(fpMeta);
+
+                        const fpImg = document.createElement('img');
+                        fpImg.src = `/api/session/${s.id}/floorplan.png?t=${Date.now()}`;
+                        fpImg.alt = 'Floor Plan';
+                        fpImg.onclick = () => window.open(fpImg.src, '_blank');
+                        fpDiv.appendChild(fpImg);
+
+                        // Re-generate button
+                        const regenBtn = document.createElement('button');
+                        regenBtn.className = 'btn-floorplan';
+                        regenBtn.textContent = 'Try Different Options';
+                        regenBtn.style.marginTop = '8px';
+                        regenBtn.onclick = () => detectWalls(s.id);
+                        fpDiv.appendChild(regenBtn);
+
+                        item.appendChild(fpDiv);
+                    }
+
+                    if (fpStatus === 'error' && s.floorplan_error) {
+                        const fpErr = document.createElement('div');
+                        fpErr.className = 'slam-error';
+                        fpErr.textContent = `Floor plan error: ${s.floorplan_error}`;
+                        item.appendChild(fpErr);
+
+                        // Retry button
+                        if (s.slam_result) {
+                            const retryBtn = document.createElement('button');
+                            retryBtn.className = 'btn-floorplan';
+                            retryBtn.textContent = 'Retry Wall Detection';
+                            retryBtn.style.marginTop = '6px';
+                            retryBtn.onclick = () => detectWalls(s.id);
+                            item.appendChild(retryBtn);
+                        }
+                    }
+
+                    // Candidate floor plans grid
+                    if (fpStatus === 'candidates_ready' && s.floorplan_candidates && s.floorplan_candidates.length > 0) {
+                        const title = document.createElement('div');
+                        title.className = 'candidates-title';
+                        title.textContent = `${s.floorplan_candidates.length} floor plan option${s.floorplan_candidates.length > 1 ? 's' : ''} — tap the one that matches your room:`;
+                        item.appendChild(title);
+
+                        const grid = document.createElement('div');
+                        grid.className = 'candidates-grid';
+
+                        s.floorplan_candidates.forEach(c => {
+                            const card = document.createElement('div');
+                            card.className = 'candidate-card';
+                            card.onclick = () => pickCandidate(s.id, c.id);
+
+                            const img = document.createElement('img');
+                            img.src = `/api/session/${s.id}/floorplan/candidate/${c.id}.png?t=${Date.now()}`;
+                            img.alt = `Option ${c.id}`;
+                            card.appendChild(img);
+
+                            const dims = document.createElement('div');
+                            dims.className = 'candidate-dims';
+                            const dimsSorted = c.dimensions.slice().sort((a,b) => a-b);
+                            dims.textContent = dimsSorted.map(d => d.toFixed(2) + 'm').join(' x ');
+                            card.appendChild(dims);
+
+                            const detail = document.createElement('div');
+                            detail.className = 'candidate-detail';
+                            detail.textContent = `${c.num_walls} walls | ${c.area_m2} m\u00B2`;
+                            card.appendChild(detail);
+
+                            grid.appendChild(card);
+                        });
+
+                        item.appendChild(grid);
+                    }
+
+                    // Show "Generate Floor Plan" button if SLAM done but no candidates yet
+                    if (s.slam_result && !fpStatus && !fpProcessing) {
+                        const fpBtn = document.createElement('button');
+                        fpBtn.className = 'btn-floorplan primary';
+                        fpBtn.textContent = 'Generate Floor Plan';
+                        fpBtn.style.marginTop = '8px';
+                        fpBtn.onclick = () => detectWalls(s.id);
+                        item.appendChild(fpBtn);
+
+                        const orthoDiv = document.createElement('div');
+                        orthoDiv.className = 'ortho-toggle';
+                        const orthoCheck = document.createElement('input');
+                        orthoCheck.type = 'checkbox';
+                        orthoCheck.id = `ortho-${s.id}`;
+                        orthoCheck.checked = true;
+                        const orthoLabel = document.createElement('label');
+                        orthoLabel.htmlFor = orthoCheck.id;
+                        orthoLabel.textContent = 'Snap to 90\u00B0 (rectangular rooms)';
+                        orthoDiv.appendChild(orthoCheck);
+                        orthoDiv.appendChild(orthoLabel);
+                        item.appendChild(orthoDiv);
+                    }
+
+                    container.appendChild(item);
+                });
+            } catch (e) {
+                console.error('Failed to load sessions', e);
+            }
+        }
+
+        // --- Init ---
+        checkStatus();
+        loadSessions();
+        connectSSE();
+        setInterval(checkStatus, 10000);
+    </script>
+</body>
+</html>
