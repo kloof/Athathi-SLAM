@@ -20,9 +20,11 @@ import shlex
 import shutil
 import signal
 import subprocess
+import sys
 import threading
 import time
 from datetime import datetime
+
 
 import cv2
 import yaml
@@ -403,36 +405,38 @@ def _extract_mp4_from_mcap(session_dir, session_id=None):
 
 def _wait_for_topics(timeout=30):
     """Wait for /unilidar/cloud topic to appear."""
-    cmd = f'source {ROS_SETUP} && ros2 topic list'
-    for _ in range(timeout):
-        try:
-            result = subprocess.run(
-                cmd, shell=True, executable='/bin/bash',
-                capture_output=True, text=True, timeout=20
-            )
-            if '/unilidar/cloud' in result.stdout:
-                return True
-        except subprocess.TimeoutExpired:
-            pass
-        time.sleep(1)
-    return False
+    return _wait_for_topic('/unilidar/cloud', timeout=timeout)
 
 
 def _wait_for_topic(topic, timeout=15):
-    """Wait for a specific ROS2 topic to appear."""
-    cmd = f'source {ROS_SETUP} && ros2 topic list'
-    for _ in range(timeout):
-        try:
-            result = subprocess.run(
-                cmd, shell=True, executable='/bin/bash',
-                capture_output=True, text=True, timeout=20
-            )
-            if topic in result.stdout:
-                return True
-        except subprocess.TimeoutExpired:
-            pass
-        time.sleep(1)
-    return False
+    """Wait for a specific ROS2 topic using a fast rclpy subprocess."""
+    # Use a single subprocess that sources ROS2 and polls with rclpy
+    # This is ~10x faster than `ros2 topic list` CLI
+    script = f'''
+import rclpy, time, sys
+rclpy.init()
+node = rclpy.create_node("_topic_wait")
+deadline = time.time() + {timeout}
+while time.time() < deadline:
+    topics = [t[0] for t in node.get_topic_names_and_types()]
+    if "{topic}" in topics:
+        node.destroy_node()
+        rclpy.shutdown()
+        sys.exit(0)
+    time.sleep(0.5)
+node.destroy_node()
+rclpy.shutdown()
+sys.exit(1)
+'''
+    try:
+        result = subprocess.run(
+            f'source {ROS_SETUP} && python3 -c {shlex.quote(script)}',
+            shell=True, executable='/bin/bash',
+            capture_output=True, timeout=timeout + 5
+        )
+        return result.returncode == 0
+    except subprocess.TimeoutExpired:
+        return False
 
 
 def _start_bag_record(output_dir, topics=None):
@@ -616,18 +620,12 @@ def _recording_thread(session_id, session_name):
             camera_proc = _launch_camera()
             _active_recording['camera_proc'] = camera_proc
             _log(f'Camera launched: PID={camera_proc.pid}')
-            time.sleep(3)
-            poll = camera_proc.poll()
-            _log(f'Camera proc status after 3s: poll={poll}')
-            if poll is not None and camera_proc.stderr:
-                stderr = camera_proc.stderr.read().decode()[:500]
-                _log(f'Camera stderr: {stderr}')
             tf_proc = _launch_tf_static()
             _active_recording['tf_proc'] = tf_proc
         _active_recording['camera_ok'] = camera_ok
 
-        # Wait for driver warmup
-        time.sleep(5)
+        # Brief warmup — just enough to catch immediate crashes
+        time.sleep(2)
         if driver_proc.poll() is not None:
             session['status'] = 'error'
             session['error'] = 'Driver exited during warmup'
