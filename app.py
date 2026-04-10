@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
-"""Flask web app for ROS2 bag recording with Unitree L2 LiDAR.
+"""Flask web app for ROS2 bag recording with Unitree L2 LiDAR + Logitech Brio camera.
 
 Provides a web interface to start/stop rosbag recordings and list sessions.
+Camera is optional — falls back to LiDAR-only if not connected.
 Runs on Raspberry Pi 4, accessible over local network.
 
 Usage:
@@ -23,6 +24,8 @@ import threading
 import time
 from datetime import datetime
 
+import cv2
+import yaml
 from flask import Flask, Response, jsonify, redirect, render_template, request, send_file
 
 # ---------------------------------------------------------------------------
@@ -30,7 +33,8 @@ from flask import Flask, Response, jsonify, redirect, render_template, request, 
 # ---------------------------------------------------------------------------
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-RECORDINGS_DIR = os.path.join(SCRIPT_DIR, 'recordings')
+_USB_RECORDINGS = '/mnt/slam_data/recordings'
+RECORDINGS_DIR = _USB_RECORDINGS if os.path.isdir('/mnt/slam_data') else os.path.join(SCRIPT_DIR, 'recordings')
 SESSIONS_FILE = os.path.join(SCRIPT_DIR, 'sessions.json')
 
 SLAM_API_URL = 'https://slam-service-348149010358.us-central1.run.app'
@@ -42,7 +46,21 @@ LIDAR_IP = '192.168.1.62'
 ROS_SETUP = '/opt/ros/humble/setup.bash'
 DRIVER_SETUP = '/home/talal/unilidar_sdk2/unitree_lidar_ros2/install/setup.bash'
 
+# Camera settings (Logitech Brio)
+CAMERA_DEVICE = '/dev/video0'
+CAMERA_WIDTH = 1280
+CAMERA_HEIGHT = 720
+CAMERA_FPS = 10
+CALIBRATION_DIR = os.path.join(SCRIPT_DIR, 'calibration')
+INTRINSICS_FILE = os.path.join(CALIBRATION_DIR, 'intrinsics.yaml')
+EXTRINSICS_FILE = os.path.join(CALIBRATION_DIR, 'extrinsics.yaml')
+
 app = Flask(__name__)
+
+_LOG_FILE = '/tmp/slam_app_debug.log'
+def _log(msg):
+    with open(_LOG_FILE, 'a') as f:
+        f.write(f'{datetime.now().isoformat()} {msg}\n')
 
 # ---------------------------------------------------------------------------
 # Session persistence
@@ -95,13 +113,16 @@ def _delete_session(session_id):
 # Recording state
 # ---------------------------------------------------------------------------
 
-_record_lock = threading.Lock()
+_record_lock = threading.RLock()
 _active_recording = {
     'session_id': None,
     'driver_proc': None,
+    'camera_proc': None,
+    'tf_proc': None,
     'bag_proc': None,
     'start_time': None,
     'starting': False,
+    'camera_ok': False,
 }
 
 # ---------------------------------------------------------------------------
@@ -118,11 +139,27 @@ def _is_recording():
     if proc is None:
         return False
     if proc.poll() is not None:
-        # bag process died — only clean up under lock to avoid races
+        # bag process died — clean up ALL associated processes under lock
         with _record_lock:
             if _active_recording['bag_proc'] is proc:
+                _kill_process_group(_active_recording.get('driver_proc'))
+                _kill_process_group(_active_recording.get('camera_proc'))
+                _kill_process_group(_active_recording.get('tf_proc'))
+                # Update session status so it doesn't stay stuck as 'recording'
+                sid = _active_recording.get('session_id')
+                if sid:
+                    session = _get_session(sid)
+                    if session and session.get('status') == 'recording':
+                        session['status'] = 'error'
+                        session['error'] = 'Recording process died unexpectedly'
+                        _put_session(sid, session)
                 _active_recording['bag_proc'] = None
+                _active_recording['driver_proc'] = None
+                _active_recording['camera_proc'] = None
+                _active_recording['tf_proc'] = None
                 _active_recording['start_time'] = None
+                _active_recording['session_id'] = None
+                _active_recording['camera_ok'] = False
         return False
     return True
 
@@ -176,6 +213,42 @@ def _ping_lidar():
     return result.returncode == 0
 
 
+def _find_camera_device():
+    """Find the Brio camera device node dynamically (index 0 = RGB capture)."""
+    sysfs = '/sys/class/video4linux'
+    if not os.path.isdir(sysfs):
+        return None
+    for dev_name in sorted(os.listdir(sysfs)):
+        name_path = os.path.join(sysfs, dev_name, 'name')
+        index_path = os.path.join(sysfs, dev_name, 'index')
+        try:
+            with open(name_path) as f:
+                name = f.read().strip()
+            with open(index_path) as f:
+                index = int(f.read().strip())
+            if 'Logitech BRIO' in name and index == 0:
+                return f'/dev/{dev_name}'
+        except (OSError, ValueError):
+            continue
+    return None
+
+
+def _check_camera():
+    """Check if Brio camera is connected. Updates CAMERA_DEVICE dynamically."""
+    global CAMERA_DEVICE
+    try:
+        dev = _find_camera_device()
+        if dev is None:
+            return False, 'No camera device'
+        CAMERA_DEVICE = dev
+        dev_base = os.path.basename(dev)
+        with open(f'/sys/class/video4linux/{dev_base}/name') as f:
+            name = f.read().strip()
+        return True, f'{name} ({dev})'
+    except Exception as e:
+        return False, str(e)
+
+
 # ---------------------------------------------------------------------------
 # Driver + recording management
 # ---------------------------------------------------------------------------
@@ -207,6 +280,127 @@ def _launch_driver():
     )
 
 
+def _set_brio_fov(fov=90):
+    """Set Brio FOV using cameractrls (must be called before v4l2_camera takes the device)."""
+    try:
+        subprocess.run(
+            ['python3', '/tmp/cameractrls/cameractrls.py',
+             '-d', CAMERA_DEVICE, '-c', f'logitech_brio_fov={fov}'],
+            capture_output=True, timeout=5
+        )
+    except Exception:
+        pass
+
+
+def _launch_camera():
+    """Launch the v4l2_camera ROS2 node for Brio."""
+    _set_brio_fov(90)
+    time.sleep(1)  # Wait for cameractrls to release the device
+
+    camera_info_param = ''
+    if os.path.isfile(INTRINSICS_FILE):
+        camera_info_param = f'-p camera_info_url:="file://{INTRINSICS_FILE}" '
+
+    cmd = (
+        f'source {ROS_SETUP} && '
+        f'ros2 run v4l2_camera v4l2_camera_node '
+        f'--ros-args '
+        f'-p video_device:={CAMERA_DEVICE} '
+        f'-p image_size:="[{CAMERA_WIDTH},{CAMERA_HEIGHT}]" '
+        f'-p pixel_format:=YUYV '
+        f'{camera_info_param}'
+        f'-p auto_exposure:=3 '
+        f'-r __ns:=/camera '
+    )
+    return subprocess.Popen(
+        cmd, shell=True, executable='/bin/bash',
+        stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+        preexec_fn=os.setsid
+    )
+
+
+def _launch_tf_static():
+    """Publish camera-to-lidar static transform if extrinsics exist."""
+    if not os.path.isfile(EXTRINSICS_FILE):
+        return None
+
+    try:
+        with open(EXTRINSICS_FILE) as f:
+            ext = yaml.safe_load(f)
+        t = ext['translation']
+        r = ext['rotation']
+    except Exception as e:
+        print(f'Warning: Failed to read extrinsics: {e}')
+        return None
+
+    cmd = (
+        f'source {ROS_SETUP} && '
+        f'ros2 run tf2_ros static_transform_publisher '
+        f'--x {t["x"]} --y {t["y"]} --z {t["z"]} '
+        f'--qx {r["x"]} --qy {r["y"]} --qz {r["z"]} --qw {r["w"]} '
+        f'--frame-id unilidar_lidar --child-frame-id camera_optical_frame'
+    )
+    return subprocess.Popen(
+        cmd, shell=True, executable='/bin/bash',
+        stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+        preexec_fn=os.setsid
+    )
+
+
+def _extract_mp4_from_mcap(session_dir, session_id=None):
+    """Extract camera frames from MCAP rosbag into a standalone MP4."""
+    try:
+        from mcap.reader import make_reader
+        from mcap_ros2.decoder import DecoderFactory
+        import numpy as np
+
+        bag_dir = os.path.join(session_dir, 'rosbag')
+        mcap_file = None
+        for f in os.listdir(bag_dir):
+            if f.endswith('.mcap'):
+                mcap_file = os.path.join(bag_dir, f)
+                break
+        if not mcap_file:
+            return
+
+        mp4_path = os.path.join(session_dir, 'video.mp4')
+        writer = None
+
+        with open(mcap_file, 'rb') as fh:
+            reader = make_reader(fh, decoder_factories=[DecoderFactory()])
+            for schema, channel, message, decoded in reader.iter_decoded_messages(
+                topics=['/camera/image_raw/compressed']
+            ):
+                jpg_data = np.frombuffer(bytes(decoded.data), dtype=np.uint8)
+                frame = cv2.imdecode(jpg_data, cv2.IMREAD_COLOR)
+                if frame is None:
+                    continue
+                if writer is None:
+                    h, w = frame.shape[:2]
+                    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+                    writer = cv2.VideoWriter(mp4_path, fourcc, CAMERA_FPS, (w, h))
+                writer.write(frame)
+
+        if writer:
+            writer.release()
+            print(f'Extracted video: {mp4_path}')
+
+        # Update session with extraction result
+        if session_id:
+            session = _get_session(session_id)
+            if session:
+                session['video_extracted'] = writer is not None
+                _put_session(session_id, session)
+
+    except Exception as e:
+        print(f'MP4 extraction failed: {e}')
+        if session_id:
+            session = _get_session(session_id)
+            if session:
+                session['video_extracted'] = False
+                _put_session(session_id, session)
+
+
 def _wait_for_topics(timeout=30):
     """Wait for /unilidar/cloud topic to appear."""
     cmd = f'source {ROS_SETUP} && ros2 topic list'
@@ -214,7 +408,7 @@ def _wait_for_topics(timeout=30):
         try:
             result = subprocess.run(
                 cmd, shell=True, executable='/bin/bash',
-                capture_output=True, text=True, timeout=5
+                capture_output=True, text=True, timeout=20
             )
             if '/unilidar/cloud' in result.stdout:
                 return True
@@ -224,17 +418,37 @@ def _wait_for_topics(timeout=30):
     return False
 
 
-def _start_bag_record(output_dir):
+def _wait_for_topic(topic, timeout=15):
+    """Wait for a specific ROS2 topic to appear."""
+    cmd = f'source {ROS_SETUP} && ros2 topic list'
+    for _ in range(timeout):
+        try:
+            result = subprocess.run(
+                cmd, shell=True, executable='/bin/bash',
+                capture_output=True, text=True, timeout=20
+            )
+            if topic in result.stdout:
+                return True
+        except subprocess.TimeoutExpired:
+            pass
+        time.sleep(1)
+    return False
+
+
+def _start_bag_record(output_dir, topics=None):
     """Start ros2 bag record process."""
+    if topics is None:
+        topics = ['/unilidar/cloud', '/unilidar/imu']
     os.makedirs(output_dir, exist_ok=True)
     bag_path = os.path.join(output_dir, 'rosbag')
+    topics_str = ' '.join(topics)
     cmd = (
         f'source {ROS_SETUP} && '
         f'ros2 bag record '
         f'-o {shlex.quote(bag_path)} '
         f'--storage mcap '
         f'--max-cache-size 200000000 '
-        f'/unilidar/cloud /unilidar/imu'
+        f'{topics_str}'
     )
     return subprocess.Popen(
         cmd, shell=True, executable='/bin/bash',
@@ -272,6 +486,7 @@ def api_status():
     """Get current system status (read-only, no side effects)."""
     net_ok, net_msg = _check_network()
     lidar_reachable = _ping_lidar() if net_ok else False
+    camera_ok, camera_msg = _check_camera()
 
     recording = _is_recording()
     elapsed = 0
@@ -283,6 +498,11 @@ def api_status():
     return jsonify({
         'network': {'ok': net_ok, 'message': net_msg},
         'lidar_reachable': lidar_reachable,
+        'camera': {'ok': camera_ok, 'message': camera_msg},
+        'calibrated': {
+            'intrinsics': os.path.isfile(INTRINSICS_FILE),
+            'extrinsics': os.path.isfile(EXTRINSICS_FILE),
+        },
         'recording': recording,
         'elapsed': elapsed,
         'active_session': active_session,
@@ -376,10 +596,12 @@ def api_record_start():
 
 
 def _recording_thread(session_id, session_name):
-    """Background thread: launch driver, wait for topics, start bag record."""
+    """Background thread: launch driver + camera, wait for topics, start bag record."""
     driver_proc = None
+    camera_proc = None
+    tf_proc = None
     try:
-        # Launch driver
+        # Launch LiDAR driver
         session = _get_session(session_id)
         session['status'] = 'launching_driver'
         _put_session(session_id, session)
@@ -387,36 +609,86 @@ def _recording_thread(session_id, session_name):
         driver_proc = _launch_driver()
         _active_recording['driver_proc'] = driver_proc
 
+        # Launch camera (optional)
+        camera_ok, camera_msg = _check_camera()
+        _log(f'Camera check: ok={camera_ok}, msg={camera_msg}, device={CAMERA_DEVICE}')
+        if camera_ok:
+            camera_proc = _launch_camera()
+            _active_recording['camera_proc'] = camera_proc
+            _log(f'Camera launched: PID={camera_proc.pid}')
+            time.sleep(3)
+            poll = camera_proc.poll()
+            _log(f'Camera proc status after 3s: poll={poll}')
+            if poll is not None and camera_proc.stderr:
+                stderr = camera_proc.stderr.read().decode()[:500]
+                _log(f'Camera stderr: {stderr}')
+            tf_proc = _launch_tf_static()
+            _active_recording['tf_proc'] = tf_proc
+        _active_recording['camera_ok'] = camera_ok
+
         # Wait for driver warmup
         time.sleep(5)
         if driver_proc.poll() is not None:
             session['status'] = 'error'
             session['error'] = 'Driver exited during warmup'
             _put_session(session_id, session)
+            _kill_process_group(camera_proc)
+            _kill_process_group(tf_proc)
             _active_recording['driver_proc'] = None
+            _active_recording['camera_proc'] = None
+            _active_recording['tf_proc'] = None
+            _active_recording['camera_ok'] = False
             return
 
-        # Wait for topics
+        # Wait for LiDAR topics
         session['status'] = 'waiting_for_topics'
         _put_session(session_id, session)
 
+        _log('Waiting for LiDAR topics...')
         if not _wait_for_topics(timeout=30):
+            _log('LiDAR topics NOT found after 30s')
             session['status'] = 'error'
             session['error'] = 'Topics not found after 30s'
             _put_session(session_id, session)
             _kill_process_group(driver_proc)
+            _kill_process_group(camera_proc)
+            _kill_process_group(tf_proc)
             _active_recording['driver_proc'] = None
+            _active_recording['camera_proc'] = None
+            _active_recording['tf_proc'] = None
             return
+
+        _log('LiDAR topics found!')
+
+        # Wait for camera topics (non-fatal if missing)
+        if camera_ok:
+            _log('Waiting for camera topic...')
+            camera_topic_ok = _wait_for_topic('/camera/image_raw', timeout=15)
+            _log(f'Camera topic found: {camera_topic_ok}')
+            if not camera_topic_ok:
+                _log('WARNING: Camera topic not found, recording without camera')
+                camera_ok = False
+                _active_recording['camera_ok'] = False
+
+        # Build topic list
+        topics = ['/unilidar/cloud', '/unilidar/imu']
+        if camera_ok:
+            topics.extend([
+                '/camera/image_raw/compressed',
+                '/camera/camera_info',
+                '/tf_static',
+            ])
 
         # Start recording
         output_dir = os.path.join(RECORDINGS_DIR, session_name)
-        bag_proc = _start_bag_record(output_dir)
+        bag_proc = _start_bag_record(output_dir, topics)
 
         _active_recording['session_id'] = session_id
         _active_recording['bag_proc'] = bag_proc
         _active_recording['start_time'] = time.time()
 
         session['status'] = 'recording'
+        session['camera'] = camera_ok
         _put_session(session_id, session)
 
     except Exception as e:
@@ -425,12 +697,16 @@ def _recording_thread(session_id, session_name):
             session['status'] = 'error'
             session['error'] = str(e)
             _put_session(session_id, session)
-        # Cleanup — use local variable to avoid missing a launched process
         _kill_process_group(driver_proc)
+        _kill_process_group(camera_proc)
+        _kill_process_group(tf_proc)
         _active_recording['driver_proc'] = None
+        _active_recording['camera_proc'] = None
+        _active_recording['tf_proc'] = None
         _active_recording['bag_proc'] = None
         _active_recording['session_id'] = None
         _active_recording['start_time'] = None
+        _active_recording['camera_ok'] = False
     finally:
         _active_recording['starting'] = False
 
@@ -445,13 +721,18 @@ def api_record_stop():
         session_id = _active_recording['session_id']
         bag_proc = _active_recording['bag_proc']
         driver_proc = _active_recording['driver_proc']
+        camera_proc = _active_recording['camera_proc']
+        tf_proc = _active_recording['tf_proc']
         start_time = _active_recording['start_time']
+        camera_ok = _active_recording['camera_ok']
 
         # Stop bag recording
         _kill_process_group(bag_proc)
 
-        # Stop driver
+        # Stop driver and camera
         _kill_process_group(driver_proc)
+        _kill_process_group(camera_proc)
+        _kill_process_group(tf_proc)
 
         duration = round(time.time() - start_time, 1) if start_time else 0
 
@@ -471,33 +752,254 @@ def api_record_stop():
                 )
                 session['bag_size'] = f'{total / (1024*1024):.1f} MB'
 
+            # Build topic list for metadata
+            topics = ['/unilidar/cloud', '/unilidar/imu']
+            if camera_ok:
+                topics.extend(['/camera/image_raw/compressed',
+                               '/camera/camera_info', '/tf_static'])
+
             # Save metadata file
-            meta_path = os.path.join(RECORDINGS_DIR, session['name'], 'metadata.txt')
+            session_dir = os.path.join(RECORDINGS_DIR, session['name'])
+            meta_path = os.path.join(session_dir, 'metadata.txt')
             try:
                 with open(meta_path, 'w') as f:
                     f.write(f"Session: {session['name']}\n")
                     f.write(f"Date: {datetime.now().isoformat()}\n")
                     f.write(f"Duration: {duration}s\n")
                     f.write(f"Bag size: {session.get('bag_size', 'unknown')}\n")
-                    f.write(f"Topics: /unilidar/cloud /unilidar/imu\n")
+                    f.write(f"Topics: {' '.join(topics)}\n")
+                    f.write(f"Camera: {'yes' if camera_ok else 'no'}\n")
+                    if camera_ok:
+                        f.write(f"Camera resolution: {CAMERA_WIDTH}x{CAMERA_HEIGHT}@{CAMERA_FPS}fps\n")
+                        f.write(f"Intrinsics: {'calibrated' if os.path.isfile(INTRINSICS_FILE) else 'uncalibrated'}\n")
+                        f.write(f"Extrinsics: {'calibrated' if os.path.isfile(EXTRINSICS_FILE) else 'uncalibrated'}\n")
                     f.write(f"Notes:\n")
             except OSError:
                 pass
 
+            # Copy calibration files into session directory
+            calib_dest = os.path.join(session_dir, 'calibration')
+            os.makedirs(calib_dest, exist_ok=True)
+            for src_file in [INTRINSICS_FILE, EXTRINSICS_FILE]:
+                if os.path.isfile(src_file):
+                    shutil.copy2(src_file, calib_dest)
+
             _put_session(session_id, session)
+
+            # Extract MP4 from MCAP in background (if camera was active)
+            if camera_ok:
+                threading.Thread(
+                    target=_extract_mp4_from_mcap,
+                    args=(session_dir, session_id),
+                    daemon=True,
+                ).start()
 
         # Reset state
         _active_recording['session_id'] = None
         _active_recording['bag_proc'] = None
         _active_recording['driver_proc'] = None
+        _active_recording['camera_proc'] = None
+        _active_recording['tf_proc'] = None
         _active_recording['start_time'] = None
         _active_recording['starting'] = False
+        _active_recording['camera_ok'] = False
 
         return jsonify({
             'session_id': session_id,
             'duration': duration,
             'bag_size': session.get('bag_size') if session else None,
         })
+
+
+@app.route('/api/camera/preview')
+def api_camera_preview():
+    """MJPEG stream for camera preview (only when not recording)."""
+    if _is_busy():
+        return jsonify({'error': 'Camera busy during recording'}), 409
+
+    camera_ok, _ = _check_camera()
+    if not camera_ok:
+        return jsonify({'error': 'No camera connected'}), 404
+
+    def generate():
+        cap = cv2.VideoCapture(CAMERA_DEVICE, cv2.CAP_V4L2)
+        if not cap.isOpened():
+            cap.release()
+            return
+        cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 360)
+        cap.set(cv2.CAP_PROP_FPS, 3)
+        try:
+            while True:
+                if _is_busy():
+                    break
+                ret, frame = cap.read()
+                if not ret:
+                    break
+                _, jpeg = cv2.imencode('.jpg', frame,
+                                       [cv2.IMWRITE_JPEG_QUALITY, 50])
+                yield (b'--frame\r\n'
+                       b'Content-Type: image/jpeg\r\n\r\n' +
+                       jpeg.tobytes() + b'\r\n')
+                time.sleep(0.33)
+        finally:
+            cap.release()
+
+    return Response(generate(),
+                    mimetype='multipart/x-mixed-replace; boundary=frame')
+
+
+# ---------------------------------------------------------------------------
+# Calibration API
+# ---------------------------------------------------------------------------
+
+_calibration_lock = threading.Lock()
+_active_calibration = {'proc': None, 'type': None}
+
+
+@app.route('/api/calibration/intrinsics/start', methods=['POST'])
+def api_calibrate_intrinsics_start():
+    """Start intrinsic camera calibration."""
+    with _calibration_lock:
+        if _active_calibration['proc'] is not None:
+            return jsonify({'error': 'Calibration already running'}), 409
+        if _is_recording():
+            return jsonify({'error': 'Cannot calibrate during recording'}), 409
+
+        script = os.path.join(SCRIPT_DIR, 'calibrate_camera.py')
+        if not os.path.isfile(script):
+            return jsonify({'error': 'calibrate_camera.py not found'}), 404
+
+        proc = subprocess.Popen(
+            ['python3', script, '--headless',
+             '--device', CAMERA_DEVICE,
+             '--width', str(CAMERA_WIDTH),
+             '--height', str(CAMERA_HEIGHT),
+             '--output', INTRINSICS_FILE],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            preexec_fn=os.setsid
+        )
+        _active_calibration['proc'] = proc
+        _active_calibration['type'] = 'intrinsics'
+
+    return jsonify({'status': 'started'})
+
+
+@app.route('/api/calibration/intrinsics/status')
+def api_calibrate_intrinsics_status():
+    """Get intrinsic calibration progress."""
+    with _calibration_lock:
+        proc = _active_calibration['proc']
+        if proc is None or _active_calibration['type'] != 'intrinsics':
+            done = os.path.isfile(INTRINSICS_FILE)
+            return jsonify({'running': False, 'calibrated': done})
+
+        if proc.poll() is not None:
+            _active_calibration['proc'] = None
+            _active_calibration['type'] = None
+            done = os.path.isfile(INTRINSICS_FILE)
+            return jsonify({'running': False, 'calibrated': done})
+
+    # Try to read last progress line from stdout (outside lock — IO)
+    frames = None
+    target = None
+    try:
+        import select
+        while select.select([proc.stdout], [], [], 0)[0]:
+            line = proc.stdout.readline()
+            if line:
+                info = json.loads(line.decode().strip())
+                frames = info.get('frames')
+                target = info.get('target')
+    except Exception:
+        pass
+
+    return jsonify({'running': True, 'frames': frames, 'target': target})
+
+
+@app.route('/api/calibration/intrinsics/stop', methods=['POST'])
+def api_calibrate_intrinsics_stop():
+    """Stop intrinsic calibration."""
+    with _calibration_lock:
+        proc = _active_calibration['proc']
+        if proc and _active_calibration['type'] == 'intrinsics':
+            _kill_process_group(proc)
+            _active_calibration['proc'] = None
+            _active_calibration['type'] = None
+    return jsonify({'status': 'stopped'})
+
+
+@app.route('/api/calibration/extrinsics/start', methods=['POST'])
+def api_calibrate_extrinsics_start():
+    """Start automatic extrinsic calibration (headless)."""
+    with _calibration_lock:
+        if _active_calibration['proc'] is not None:
+            return jsonify({'error': 'Calibration already running'}), 409
+        if _is_recording():
+            return jsonify({'error': 'Cannot calibrate during recording'}), 409
+        if not os.path.isfile(INTRINSICS_FILE):
+            return jsonify({'error': 'Intrinsics must be calibrated first'}), 400
+
+        script = os.path.join(SCRIPT_DIR, 'calibrate_extrinsics.py')
+        if not os.path.isfile(script):
+            return jsonify({'error': 'calibrate_extrinsics.py not found'}), 404
+
+        proc = subprocess.Popen(
+            ['python3', script, '--headless', '--device', CAMERA_DEVICE],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            preexec_fn=os.setsid
+        )
+        _active_calibration['proc'] = proc
+        _active_calibration['type'] = 'extrinsics'
+
+    return jsonify({'status': 'started'})
+
+
+@app.route('/api/calibration/extrinsics')
+def api_get_extrinsics():
+    """Return current extrinsic calibration."""
+    if not os.path.isfile(EXTRINSICS_FILE):
+        return jsonify({'calibrated': False})
+    with open(EXTRINSICS_FILE) as f:
+        data = yaml.safe_load(f)
+    return jsonify({'calibrated': True, 'data': data})
+
+
+@app.route('/api/calibration/extrinsics', methods=['POST'])
+def api_set_extrinsics():
+    """Set extrinsic calibration from manual JSON input."""
+    data = request.get_json(force=True, silent=True)
+    if not data or 'translation' not in data:
+        return jsonify({'error': 'Need translation field'}), 400
+
+    os.makedirs(CALIBRATION_DIR, exist_ok=True)
+
+    # If RPY provided, convert to quaternion
+    rotation = data.get('rotation', {'x': 0, 'y': 0, 'z': 0, 'w': 1})
+    rpy = data.get('rpy_degrees')
+    if rpy and 'roll' in rpy:
+        from scipy.spatial.transform import Rotation
+        q = Rotation.from_euler('xyz',
+            [rpy['roll'], rpy['pitch'], rpy['yaw']], degrees=True).as_quat()
+        rotation = {'x': float(q[0]), 'y': float(q[1]),
+                     'z': float(q[2]), 'w': float(q[3])}
+
+    ext = {
+        'parent_frame': 'unilidar_lidar',
+        'child_frame': 'camera_optical_frame',
+        'translation': data['translation'],
+        'rotation': rotation,
+        'calibration_date': datetime.now().isoformat(),
+        'method': 'manual',
+    }
+    if rpy:
+        ext['rpy_degrees'] = rpy
+
+    with open(EXTRINSICS_FILE, 'w') as f:
+        yaml.dump(ext, f, default_flow_style=False)
+
+    return jsonify({'status': 'saved', 'data': ext})
 
 
 @app.route('/api/session/<session_id>', methods=['DELETE'])
@@ -1193,9 +1695,13 @@ def api_pick_candidate(session_id):
 # ---------------------------------------------------------------------------
 
 def _cleanup_on_exit():
-    """Kill any running driver/bag processes on app shutdown."""
+    """Kill any running driver/bag/camera processes on app shutdown."""
     _kill_process_group(_active_recording.get('bag_proc'))
     _kill_process_group(_active_recording.get('driver_proc'))
+    _kill_process_group(_active_recording.get('camera_proc'))
+    _kill_process_group(_active_recording.get('tf_proc'))
+    if _active_calibration.get('proc'):
+        _kill_process_group(_active_calibration['proc'])
 
 
 def _recover_stuck_sessions():
@@ -1206,10 +1712,12 @@ def _recover_stuck_sessions():
     sessions = _get_sessions()
     for sid, s in sessions.items():
         changed = False
-        if s.get('status') in stuck_statuses:
+        original_status = s.get('status')
+        if original_status in stuck_statuses:
             s['status'] = 'stopped'
-            s['slam_status'] = 'error'
-            s['slam_error'] = 'Interrupted by shutdown'
+            if original_status == 'processing':
+                s['slam_status'] = 'error'
+                s['slam_error'] = 'Interrupted by shutdown'
             changed = True
         if s.get('slam_status') in ('uploading', 'compressing'):
             s['slam_status'] = 'error'
@@ -1227,6 +1735,7 @@ def _recover_stuck_sessions():
 
 if __name__ == '__main__':
     os.makedirs(RECORDINGS_DIR, exist_ok=True)
+    os.makedirs(CALIBRATION_DIR, exist_ok=True)
     _recover_stuck_sessions()
     atexit.register(_cleanup_on_exit)
 

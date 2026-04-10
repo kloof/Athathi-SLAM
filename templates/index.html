@@ -91,8 +91,45 @@
                 <span class="status-value" id="s-lidar">checking...</span>
             </div>
             <div class="status-row">
+                <span class="status-label">Camera</span>
+                <span class="status-value" id="s-camera">checking...</span>
+            </div>
+            <div class="status-row">
+                <span class="status-label">Calibration</span>
+                <span class="status-value" id="s-calib">checking...</span>
+            </div>
+            <div class="status-row">
                 <span class="status-label">State</span>
                 <span class="status-value" id="s-state">idle</span>
+            </div>
+            <div id="camera-preview" style="margin-top:6px">
+                <img id="preview-img" src="/api/camera/preview"
+                     style="width:100%; border-radius:6px; display:none"
+                     onerror="this.style.display='none'; previewErrors++"
+                     onload="this.style.display='block'; previewErrors=0">
+            </div>
+        </div>
+    </div>
+
+    <!-- Calibration Card -->
+    <div class="card" id="calib-card">
+        <h2>Calibration</h2>
+        <div class="card-body">
+            <div style="display:flex; gap:6px; flex-wrap:wrap">
+                <button class="btn-process" id="btn-calib-intr" onclick="startIntrinsicCalib()">
+                    Calibrate Camera
+                </button>
+                <button class="btn-process" id="btn-calib-stop" onclick="stopIntrinsicCalib()" style="display:none">
+                    Stop Calibration
+                </button>
+            </div>
+            <div id="calib-progress" class="slam-progress" style="display:none"></div>
+            <div id="calib-status" style="font-size:0.8em; color:#888; margin-top:4px"></div>
+            <div style="margin-top:8px">
+                <button class="btn-process" id="btn-calib-extr" onclick="setExtrinsicsManual()">
+                    Set Extrinsics (Manual)
+                </button>
+                <div id="extr-status" style="font-size:0.8em; color:#888; margin-top:4px"></div>
             </div>
         </div>
     </div>
@@ -131,6 +168,7 @@
         let evtSource = null;
         let isRecording = false;
         let processingStates = {};
+        let previewErrors = 0;
 
         // --- SSE ---
         function connectSSE() {
@@ -142,6 +180,7 @@
                 updateProcessingUI(d.processing || {});
             };
             evtSource.onerror = () => {
+                evtSource.close();
                 setTimeout(connectSSE, 3000);
             };
         }
@@ -222,6 +261,31 @@
                 const lidarEl = document.getElementById('s-lidar');
                 lidarEl.textContent = d.lidar_reachable ? 'Connected' : 'Not reachable';
                 lidarEl.className = 'status-value ' + (d.lidar_reachable ? 'ok' : 'warn');
+
+                const camEl = document.getElementById('s-camera');
+                if (d.camera) {
+                    camEl.textContent = d.camera.ok ? d.camera.message : 'Not connected';
+                    camEl.className = 'status-value ' + (d.camera.ok ? 'ok' : 'warn');
+                    if (d.camera.ok) previewErrors = 0;
+                }
+
+                const calibEl = document.getElementById('s-calib');
+                const intrOk = d.calibrated && d.calibrated.intrinsics;
+                const extOk = d.calibrated && d.calibrated.extrinsics;
+                calibEl.textContent = intrOk && extOk ? 'Ready' : intrOk ? 'Intrinsics only' : 'Not calibrated';
+                calibEl.className = 'status-value ' + (intrOk && extOk ? 'ok' : 'warn');
+
+                // Hide preview during recording
+                const previewImg = document.getElementById('preview-img');
+                if (d.recording) {
+                    previewImg.style.display = 'none';
+                    previewImg.src = '';
+                } else if (!previewImg.src.includes('/api/camera/preview') && previewErrors < 3) {
+                    previewImg.src = '/api/camera/preview';
+                }
+
+                // Show/hide calibration card based on camera
+                document.getElementById('calib-card').style.display = d.camera.ok ? 'block' : 'none';
             } catch (e) {
                 document.getElementById('s-network').textContent = 'Fetch error';
             }
@@ -581,6 +645,86 @@
             } catch (e) {
                 console.error('Failed to load sessions', e);
             }
+        }
+
+        // --- Calibration ---
+        async function startIntrinsicCalib() {
+            try {
+                const res = await fetch('/api/calibration/intrinsics/start', {method: 'POST'});
+                const d = await res.json();
+                if (!res.ok) { alert(d.error || 'Failed'); return; }
+                document.getElementById('btn-calib-intr').style.display = 'none';
+                document.getElementById('btn-calib-stop').style.display = 'inline-block';
+                document.getElementById('calib-progress').style.display = 'block';
+                document.getElementById('calib-progress').textContent = 'Hold checkerboard in front of camera...';
+                pollCalibStatus();
+            } catch (e) { alert('Error: ' + e.message); }
+        }
+
+        async function stopIntrinsicCalib() {
+            await fetch('/api/calibration/intrinsics/stop', {method: 'POST'});
+            document.getElementById('btn-calib-intr').style.display = 'inline-block';
+            document.getElementById('btn-calib-stop').style.display = 'none';
+            document.getElementById('calib-progress').style.display = 'none';
+        }
+
+        async function pollCalibStatus() {
+            try {
+                const res = await fetch('/api/calibration/intrinsics/status');
+                const d = await res.json();
+                if (d.running) {
+                    if (d.frames != null) {
+                        document.getElementById('calib-progress').textContent =
+                            d.frames + '/' + (d.target || 15) + ' frames captured';
+                    }
+                    setTimeout(pollCalibStatus, 2000);
+                } else {
+                    document.getElementById('btn-calib-intr').style.display = 'inline-block';
+                    document.getElementById('btn-calib-stop').style.display = 'none';
+                    document.getElementById('calib-progress').style.display = 'none';
+                    if (d.calibrated) {
+                        document.getElementById('calib-status').textContent = 'Intrinsics calibrated successfully';
+                        document.getElementById('calib-status').style.color = '#4ecca3';
+                    } else {
+                        document.getElementById('calib-status').textContent = 'Calibration failed — try again';
+                        document.getElementById('calib-status').style.color = '#e94560';
+                    }
+                    checkStatus();
+                }
+            } catch (e) { setTimeout(pollCalibStatus, 3000); }
+        }
+
+        async function setExtrinsicsManual() {
+            const input = prompt(
+                'Enter camera-to-LiDAR offset as: tx ty tz roll pitch yaw\n' +
+                'Translation in meters, rotation in degrees\n' +
+                'Example: 0.0 0.05 0.02 0 -90 0');
+            if (!input) return;
+            const parts = input.trim().split(/\s+/).map(Number);
+            if (parts.length !== 6 || parts.some(isNaN)) {
+                alert('Need 6 numbers: tx ty tz roll pitch yaw');
+                return;
+            }
+            // Convert RPY to quaternion on the server side
+            try {
+                const res = await fetch('/api/calibration/extrinsics', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({
+                        translation: {x: parts[0], y: parts[1], z: parts[2]},
+                        rotation: {x: 0, y: 0, z: 0, w: 1},
+                        rpy_degrees: {roll: parts[3], pitch: parts[4], yaw: parts[5]}
+                    }),
+                });
+                const d = await res.json();
+                if (res.ok) {
+                    document.getElementById('extr-status').textContent = 'Extrinsics saved';
+                    document.getElementById('extr-status').style.color = '#4ecca3';
+                    checkStatus();
+                } else {
+                    alert(d.error || 'Failed to save');
+                }
+            } catch (e) { alert('Error: ' + e.message); }
         }
 
         // --- Init ---
