@@ -38,9 +38,9 @@ ROS_SETUP = '/opt/ros/humble/setup.bash'
 DRIVER_SETUP = '/home/talal/unilidar_sdk2/unitree_lidar_ros2/install/setup.bash'
 
 # Checkerboard parameters (must match calibrate_camera.py)
-BOARD_ROWS = 6
-BOARD_COLS = 9
-SQUARE_SIZE = 0.025  # meters
+BOARD_ROWS = 7    # 8 squares - 1
+BOARD_COLS = 10   # 11 squares - 1
+SQUARE_SIZE = 0.022  # 22mm measured from print
 
 # LiDAR coordinate frame:
 #   Origin: center of L2 bottom mounting surface

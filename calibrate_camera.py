@@ -23,9 +23,9 @@ import yaml
 
 
 # Checkerboard inner corners (one less than squares in each dimension)
-BOARD_ROWS = 6
-BOARD_COLS = 9
-SQUARE_SIZE = 0.025  # 25mm default, adjust to your board
+BOARD_ROWS = 7    # 8 squares - 1
+BOARD_COLS = 10   # 11 squares - 1
+SQUARE_SIZE = 0.022  # 22mm measured from print
 
 MIN_FRAMES = 15
 MAX_FRAMES = 25
