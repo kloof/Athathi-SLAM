@@ -76,9 +76,14 @@ bag_dir = '${RECORD_DIR}/rosbag'
 mcap_files = glob.glob(os.path.join(bag_dir, '*.mcap'))
 if not mcap_files: exit()
 writer = None
+stride = 3  # capture 30 fps -> output 10 fps (real-time playback)
+idx = 0
 with open(mcap_files[0], 'rb') as fh:
     reader = make_reader(fh, decoder_factories=[DecoderFactory()])
     for _, _, _, decoded in reader.iter_decoded_messages(topics=['/camera/image_raw/compressed']):
+        if idx % stride != 0:
+            idx += 1; continue
+        idx += 1
         frame = cv2.imdecode(np.frombuffer(bytes(decoded.data), np.uint8), cv2.IMREAD_COLOR)
         if frame is None: continue
         if writer is None:
@@ -191,9 +196,12 @@ if [ "$CAMERA_OK" = true ]; then
         --ros-args \
         -p video_device:=$CAMERA_DEVICE \
         -p "image_size:=[1280,720]" \
-        -p pixel_format:=YUYV \
+        -p pixel_format:=MJPG \
+        -p "time_per_frame:=[1,30]" \
         -p "camera_info_url:=${CAMERA_INFO_URL}" \
-        -p auto_exposure:=3 \
+        -p auto_exposure:=1 \
+        -p exposure_time_absolute:=100 \
+        -p gain:=255 \
         -r __ns:=/camera &
     CAMERA_PID=$!
 

@@ -52,7 +52,10 @@ DRIVER_SETUP = '/home/talal/unilidar_sdk2/unitree_lidar_ros2/install/setup.bash'
 CAMERA_DEVICE = '/dev/video0'
 CAMERA_WIDTH = 1280
 CAMERA_HEIGHT = 720
-CAMERA_FPS = 10
+CAMERA_FPS = 10                # output (MP4) rate
+CAMERA_FPS_CAPTURE = 30        # sensor/bag rate -- higher reduces rolling-shutter skew
+CAMERA_EXPOSURE_100US = 100  # 10 ms shutter -- still short, 2x brighter than 5 ms
+CAMERA_GAIN = 255  # 0-255, maxed analog gain
 CALIBRATION_DIR = os.path.join(SCRIPT_DIR, 'calibration')
 INTRINSICS_FILE = os.path.join(CALIBRATION_DIR, 'intrinsics.yaml')
 EXTRINSICS_FILE = os.path.join(CALIBRATION_DIR, 'extrinsics.yaml')
@@ -309,9 +312,12 @@ def _launch_camera():
         f'--ros-args '
         f'-p video_device:={CAMERA_DEVICE} '
         f'-p image_size:="[{CAMERA_WIDTH},{CAMERA_HEIGHT}]" '
-        f'-p pixel_format:=YUYV '
+        f'-p pixel_format:=MJPG '
+        f'-p time_per_frame:="[1,{CAMERA_FPS_CAPTURE}]" '
         f'{camera_info_param}'
-        f'-p auto_exposure:=3 '
+        f'-p auto_exposure:=1 '
+        f'-p exposure_time_absolute:={CAMERA_EXPOSURE_100US} '
+        f'-p gain:={CAMERA_GAIN} '
         f'-r __ns:=/camera '
     )
     return subprocess.Popen(
@@ -368,11 +374,19 @@ def _extract_mp4_from_mcap(session_dir, session_id=None):
         mp4_path = os.path.join(session_dir, 'video.mp4')
         writer = None
 
+        # Decimate capture fps -> output fps so MP4 plays at real-time
+        stride = max(1, CAMERA_FPS_CAPTURE // CAMERA_FPS)
+        frame_idx = 0
+
         with open(mcap_file, 'rb') as fh:
             reader = make_reader(fh, decoder_factories=[DecoderFactory()])
             for schema, channel, message, decoded in reader.iter_decoded_messages(
                 topics=['/camera/image_raw/compressed']
             ):
+                if frame_idx % stride != 0:
+                    frame_idx += 1
+                    continue
+                frame_idx += 1
                 jpg_data = np.frombuffer(bytes(decoded.data), dtype=np.uint8)
                 frame = cv2.imdecode(jpg_data, cv2.IMREAD_COLOR)
                 if frame is None:
@@ -820,29 +834,57 @@ def api_camera_preview():
         return jsonify({'error': 'No camera connected'}), 404
 
     def generate():
-        cap = cv2.VideoCapture(CAMERA_DEVICE, cv2.CAP_V4L2)
-        if not cap.isOpened():
-            cap.release()
-            return
-        cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 360)
-        cap.set(cv2.CAP_PROP_FPS, 3)
+        # Lock shutter + gain on the device so preview matches recording
+        subprocess.run(
+            ['v4l2-ctl', '-d', CAMERA_DEVICE,
+             f'--set-ctrl=auto_exposure=1,'
+             f'exposure_time_absolute={CAMERA_EXPOSURE_100US},'
+             f'gain={CAMERA_GAIN}'],
+            capture_output=True, timeout=2
+        )
+
+        # ffmpeg MJPG passthrough: camera emits JPEG, we forward bytes with
+        # no decode/re-encode so CPU stays low even at 30 fps.
+        proc = subprocess.Popen(
+            ['ffmpeg', '-hide_banner', '-loglevel', 'error',
+             '-f', 'v4l2', '-input_format', 'mjpeg',
+             '-video_size', '640x360', '-framerate', '30',
+             '-i', CAMERA_DEVICE,
+             '-c:v', 'copy', '-f', 'mjpeg', 'pipe:1'],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+        )
+
         try:
+            buf = bytearray()
             while True:
                 if _is_busy():
                     break
-                ret, frame = cap.read()
-                if not ret:
+                chunk = proc.stdout.read(16384)
+                if not chunk:
                     break
-                _, jpeg = cv2.imencode('.jpg', frame,
-                                       [cv2.IMWRITE_JPEG_QUALITY, 50])
-                yield (b'--frame\r\n'
-                       b'Content-Type: image/jpeg\r\n\r\n' +
-                       jpeg.tobytes() + b'\r\n')
-                time.sleep(0.33)
+                buf.extend(chunk)
+                while True:
+                    soi = buf.find(b'\xff\xd8')
+                    if soi < 0:
+                        buf.clear()
+                        break
+                    eoi = buf.find(b'\xff\xd9', soi + 2)
+                    if eoi < 0:
+                        if soi > 0:
+                            del buf[:soi]
+                        break
+                    jpeg = bytes(buf[soi:eoi + 2])
+                    del buf[:eoi + 2]
+                    yield (b'--frame\r\n'
+                           b'Content-Type: image/jpeg\r\n\r\n' +
+                           jpeg + b'\r\n')
         finally:
-            cap.release()
+            proc.terminate()
+            try:
+                proc.wait(timeout=1)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=2)  # always reap to avoid holding /dev/video1
 
     return Response(generate(),
                     mimetype='multipart/x-mixed-replace; boundary=frame')
