@@ -144,6 +144,7 @@
                     <span>Recording</span>
                     <span class="timer" id="rec-timer">0:00</span>
                 </div>
+                <div id="rec-camera-status" style="font-size:0.85em; margin-top:4px;"></div>
             </div>
             <input type="text" class="session-name" id="session-name"
                    placeholder="Session name (optional)">
@@ -234,6 +235,17 @@
                 timer.textContent = `${mins}:${secs.toString().padStart(2, '0')}`;
                 stateEl.textContent = d.status || 'recording';
                 stateEl.className = 'status-value warn';
+
+                const camStatus = document.getElementById('rec-camera-status');
+                if (d.camera_recording === null || d.camera_recording === undefined) {
+                    camStatus.textContent = '';
+                } else if (d.camera_recording) {
+                    camStatus.textContent = `Camera: streaming (${d.camera_frames} frames)`;
+                    camStatus.style.color = '#4ade80';
+                } else {
+                    camStatus.textContent = 'Camera: NOT STREAMING — stop and check the device';
+                    camStatus.style.color = '#f87171';
+                }
             } else {
                 if (isRecording) {
                     isRecording = false;

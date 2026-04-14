@@ -65,34 +65,6 @@ META
         cp -f "${CALIB_DIR}"/*.yaml "${RECORD_DIR}/calibration/" 2>/dev/null || true
     fi
 
-    # Extract MP4 from MCAP if camera was active
-    if [ "$CAMERA_OK" = true ]; then
-        echo -e "${YELLOW}Extracting video from MCAP...${RESET}"
-        python3 -c "
-import os, glob, cv2, numpy as np
-from mcap.reader import make_reader
-from mcap_ros2.decoder import DecoderFactory
-bag_dir = '${RECORD_DIR}/rosbag'
-mcap_files = glob.glob(os.path.join(bag_dir, '*.mcap'))
-if not mcap_files: exit()
-writer = None
-stride = 3  # capture 30 fps -> output 10 fps (real-time playback)
-idx = 0
-with open(mcap_files[0], 'rb') as fh:
-    reader = make_reader(fh, decoder_factories=[DecoderFactory()])
-    for _, _, _, decoded in reader.iter_decoded_messages(topics=['/camera/image_raw/compressed']):
-        if idx % stride != 0:
-            idx += 1; continue
-        idx += 1
-        frame = cv2.imdecode(np.frombuffer(bytes(decoded.data), np.uint8), cv2.IMREAD_COLOR)
-        if frame is None: continue
-        if writer is None:
-            h, w = frame.shape[:2]
-            writer = cv2.VideoWriter('${RECORD_DIR}/video.mp4', cv2.VideoWriter_fourcc(*'mp4v'), 10, (w, h))
-        writer.write(frame)
-if writer: writer.release(); print('Video extracted')
-" 2>&1 || echo -e "${YELLOW}[WARN] MP4 extraction failed${RESET}"
-    fi
     echo -e "${GREEN}Done.${RESET}"
     exit 0
 }

@@ -52,7 +52,6 @@ DRIVER_SETUP = '/home/talal/unilidar_sdk2/unitree_lidar_ros2/install/setup.bash'
 CAMERA_DEVICE = '/dev/video0'
 CAMERA_WIDTH = 1280
 CAMERA_HEIGHT = 720
-CAMERA_FPS = 10                # output (MP4) rate
 CAMERA_FPS_CAPTURE = 30        # sensor/bag rate -- higher reduces rolling-shutter skew
 CAMERA_EXPOSURE_100US = 100  # 10 ms shutter -- still short, 2x brighter than 5 ms
 CAMERA_GAIN = 255  # 0-255, maxed analog gain
@@ -119,15 +118,22 @@ def _delete_session(session_id):
 # ---------------------------------------------------------------------------
 
 _record_lock = threading.RLock()
+# Tracks the ffmpeg subprocess serving /api/camera/preview so recording can
+# reclaim /dev/video0 before launching v4l2_camera_node.
+_active_preview = {'proc': None}
 _active_recording = {
     'session_id': None,
     'driver_proc': None,
     'camera_proc': None,
     'tf_proc': None,
     'bag_proc': None,
+    'camera_monitor_proc': None,
     'start_time': None,
     'starting': False,
     'camera_ok': False,
+    'camera_frames': 0,
+    'camera_streaming': False,
+    '_camera_frames_prev': 0,
 }
 
 # ---------------------------------------------------------------------------
@@ -150,6 +156,7 @@ def _is_recording():
                 _kill_process_group(_active_recording.get('driver_proc'))
                 _kill_process_group(_active_recording.get('camera_proc'))
                 _kill_process_group(_active_recording.get('tf_proc'))
+                _kill_process_group(_active_recording.get('camera_monitor_proc'))
                 # Update session status so it doesn't stay stuck as 'recording'
                 sid = _active_recording.get('session_id')
                 if sid:
@@ -162,9 +169,12 @@ def _is_recording():
                 _active_recording['driver_proc'] = None
                 _active_recording['camera_proc'] = None
                 _active_recording['tf_proc'] = None
+                _active_recording['camera_monitor_proc'] = None
                 _active_recording['start_time'] = None
                 _active_recording['session_id'] = None
                 _active_recording['camera_ok'] = False
+                _active_recording['camera_frames'] = 0
+                _active_recording['camera_streaming'] = False
         return False
     return True
 
@@ -297,10 +307,56 @@ def _set_brio_fov(fov=90):
         pass
 
 
+_CAMERA_STDERR_LOG = '/tmp/slam_camera_stderr.log'
+
+
+def _release_camera_device(timeout=3.0):
+    """Kill the preview ffmpeg (if any) and wait for /dev/video0 to be free.
+
+    The preview holds /dev/video0 while streaming; without this, v4l2_camera_node
+    races and loses ("Device or resource busy"), producing a zombie process and
+    no topics. Must run before _launch_camera().
+    """
+    preview = _active_preview.get('proc')
+    if preview is not None:
+        try:
+            preview.terminate()
+            try:
+                preview.wait(timeout=1.5)
+            except subprocess.TimeoutExpired:
+                preview.kill()
+                preview.wait(timeout=1.5)
+        except Exception:
+            pass
+        _active_preview['proc'] = None
+
+    # Poll until we can open the device exclusively (or timeout).
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            fd = os.open(CAMERA_DEVICE, os.O_RDWR | os.O_NONBLOCK)
+            os.close(fd)
+            return True
+        except OSError:
+            time.sleep(0.1)
+    return False
+
+
 def _launch_camera():
-    """Launch the v4l2_camera ROS2 node for Brio."""
+    """Launch the usb_cam ROS2 node for Brio.
+
+    Switched from v4l2_camera_node (Humble/ARM cv_bridge::Exception on MJPG passthrough)
+    to usb_cam, which publishes the same `/camera/image_raw/compressed` topic via
+    image_transport and tolerates MJPG correctly. The `-r __ns:=/camera` remap puts
+    the node in the /camera namespace so its relative `image_raw` topic becomes
+    `/camera/image_raw`, and compressed_image_transport then creates
+    `/camera/image_raw/compressed` — matching what the bag recorder and monitor expect.
+    """
     _set_brio_fov(90)
-    time.sleep(1)  # Wait for cameractrls to release the device
+
+    # Reclaim /dev/video0 from the preview stream before the camera node opens it.
+    if not _release_camera_device(timeout=3.0):
+        _log(f'WARNING: {CAMERA_DEVICE} still busy after 3s; camera launch will likely fail')
 
     camera_info_param = ''
     if os.path.isfile(INTRINSICS_FILE):
@@ -308,21 +364,26 @@ def _launch_camera():
 
     cmd = (
         f'source {ROS_SETUP} && '
-        f'ros2 run v4l2_camera v4l2_camera_node '
+        f'ros2 run usb_cam usb_cam_node_exe '
         f'--ros-args '
         f'-p video_device:={CAMERA_DEVICE} '
-        f'-p image_size:="[{CAMERA_WIDTH},{CAMERA_HEIGHT}]" '
-        f'-p pixel_format:=MJPG '
-        f'-p time_per_frame:="[1,{CAMERA_FPS_CAPTURE}]" '
+        f'-p image_width:={CAMERA_WIDTH} '
+        f'-p image_height:={CAMERA_HEIGHT} '
+        f'-p pixel_format:=mjpeg2rgb '
+        f'-p framerate:={float(CAMERA_FPS_CAPTURE)} '
         f'{camera_info_param}'
-        f'-p auto_exposure:=1 '
-        f'-p exposure_time_absolute:={CAMERA_EXPOSURE_100US} '
+        f'-p autoexposure:=false '
+        f'-p exposure:={CAMERA_EXPOSURE_100US} '
         f'-p gain:={CAMERA_GAIN} '
+        f'-p frame_id:=camera_optical_frame '
         f'-r __ns:=/camera '
     )
+    # Redirect stderr to a log file so failures are visible post-mortem rather
+    # than trapped in an unread PIPE buffer.
+    stderr_fh = open(_CAMERA_STDERR_LOG, 'ab')
     return subprocess.Popen(
         cmd, shell=True, executable='/bin/bash',
-        stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+        stdout=subprocess.DEVNULL, stderr=stderr_fh,
         preexec_fn=os.setsid
     )
 
@@ -353,68 +414,6 @@ def _launch_tf_static():
         stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
         preexec_fn=os.setsid
     )
-
-
-def _extract_mp4_from_mcap(session_dir, session_id=None):
-    """Extract camera frames from MCAP rosbag into a standalone MP4."""
-    try:
-        from mcap.reader import make_reader
-        from mcap_ros2.decoder import DecoderFactory
-        import numpy as np
-
-        bag_dir = os.path.join(session_dir, 'rosbag')
-        mcap_file = None
-        for f in os.listdir(bag_dir):
-            if f.endswith('.mcap'):
-                mcap_file = os.path.join(bag_dir, f)
-                break
-        if not mcap_file:
-            return
-
-        mp4_path = os.path.join(session_dir, 'video.mp4')
-        writer = None
-
-        # Decimate capture fps -> output fps so MP4 plays at real-time
-        stride = max(1, CAMERA_FPS_CAPTURE // CAMERA_FPS)
-        frame_idx = 0
-
-        with open(mcap_file, 'rb') as fh:
-            reader = make_reader(fh, decoder_factories=[DecoderFactory()])
-            for schema, channel, message, decoded in reader.iter_decoded_messages(
-                topics=['/camera/image_raw/compressed']
-            ):
-                if frame_idx % stride != 0:
-                    frame_idx += 1
-                    continue
-                frame_idx += 1
-                jpg_data = np.frombuffer(bytes(decoded.data), dtype=np.uint8)
-                frame = cv2.imdecode(jpg_data, cv2.IMREAD_COLOR)
-                if frame is None:
-                    continue
-                if writer is None:
-                    h, w = frame.shape[:2]
-                    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-                    writer = cv2.VideoWriter(mp4_path, fourcc, CAMERA_FPS, (w, h))
-                writer.write(frame)
-
-        if writer:
-            writer.release()
-            print(f'Extracted video: {mp4_path}')
-
-        # Update session with extraction result
-        if session_id:
-            session = _get_session(session_id)
-            if session:
-                session['video_extracted'] = writer is not None
-                _put_session(session_id, session)
-
-    except Exception as e:
-        print(f'MP4 extraction failed: {e}')
-        if session_id:
-            session = _get_session(session_id)
-            if session:
-                session['video_extracted'] = False
-                _put_session(session_id, session)
 
 
 def _wait_for_topics(timeout=30):
@@ -475,19 +474,84 @@ def _start_bag_record(output_dir, topics=None):
     )
 
 
-def _kill_process_group(proc):
-    """Kill a process and its entire group."""
+def _kill_process_group(proc, timeout=5):
+    """Kill a process and its entire group. `timeout` is the SIGTERM grace period."""
     if proc is None:
         return
     try:
         os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
-        proc.wait(timeout=5)
+        proc.wait(timeout=timeout)
     except (ProcessLookupError, subprocess.TimeoutExpired):
         try:
             os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
             proc.wait(timeout=3)
         except (ProcessLookupError, subprocess.TimeoutExpired, OSError):
             pass
+
+
+def _start_camera_monitor():
+    """Spawn a long-lived rclpy subscriber that prints per-second frame counts.
+
+    Sensor data QoS (BEST_EFFORT) is required — most camera drivers publish with
+    that profile, and a default RELIABLE subscriber would silently receive nothing.
+    """
+    script = '''
+import sys, rclpy
+from rclpy.node import Node
+from rclpy.qos import qos_profile_sensor_data
+from sensor_msgs.msg import CompressedImage
+
+class Counter(Node):
+    def __init__(self):
+        super().__init__("_camera_monitor")
+        self.count = 0
+        self.create_subscription(
+            CompressedImage, "/camera/image_raw/compressed",
+            self._cb, qos_profile_sensor_data)
+        self.create_timer(1.0, self._emit)
+    def _cb(self, _msg):
+        self.count += 1
+    def _emit(self):
+        sys.stdout.write("FRAMES:%d\\n" % self.count)
+        sys.stdout.flush()
+
+rclpy.init()
+n = Counter()
+try:
+    rclpy.spin(n)
+except KeyboardInterrupt:
+    pass
+n.destroy_node()
+rclpy.shutdown()
+'''
+    cmd = f'source {ROS_SETUP} && python3 -u -c {shlex.quote(script)}'
+    return subprocess.Popen(
+        cmd, shell=True, executable='/bin/bash',
+        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+        preexec_fn=os.setsid,
+    )
+
+
+def _camera_monitor_reader(proc):
+    """Read FRAMES:N lines from the monitor and update _active_recording."""
+    try:
+        for raw in proc.stdout:
+            line = raw.decode('utf-8', errors='ignore').strip()
+            if not line.startswith('FRAMES:'):
+                continue
+            try:
+                count = int(line.split(':', 1)[1])
+            except ValueError:
+                continue
+            _active_recording['camera_frames'] = count
+            _active_recording['camera_streaming'] = count > _active_recording['_camera_frames_prev']
+            _active_recording['_camera_frames_prev'] = count
+    except Exception:
+        pass
+    finally:
+        # If the monitor subprocess dies or its stdout closes, don't let
+        # camera_streaming stay stuck True — surface the failure to the UI.
+        _active_recording['camera_streaming'] = False
 
 
 # ---------------------------------------------------------------------------
@@ -509,9 +573,17 @@ def api_status():
     recording = _is_recording()
     elapsed = 0
     active_session = None
+    camera_recording = None
+    camera_frames = None
     if recording and _active_recording['start_time']:
         elapsed = round(time.time() - _active_recording['start_time'], 1)
         active_session = _active_recording['session_id']
+        if _active_recording.get('camera_ok'):
+            camera_recording = bool(_active_recording.get('camera_streaming'))
+            camera_frames = int(_active_recording.get('camera_frames') or 0)
+        else:
+            camera_recording = False
+            camera_frames = 0
 
     return jsonify({
         'network': {'ok': net_ok, 'message': net_msg},
@@ -524,6 +596,8 @@ def api_status():
         'recording': recording,
         'elapsed': elapsed,
         'active_session': active_session,
+        'camera_recording': camera_recording,
+        'camera_frames': camera_frames,
     })
 
 
@@ -672,15 +746,44 @@ def _recording_thread(session_id, session_name):
 
         _log('LiDAR topics found!')
 
-        # Wait for camera topics (non-fatal if missing)
+        # Wait for camera topics (non-fatal if missing) and verify frames actually flow.
+        # Topic advertisement alone isn't enough — a stalled camera node still advertises.
+        camera_monitor_proc = None
         if camera_ok:
             _log('Waiting for camera topic...')
-            camera_topic_ok = _wait_for_topic('/camera/image_raw', timeout=15)
+            camera_topic_ok = _wait_for_topic('/camera/image_raw/compressed', timeout=15)
             _log(f'Camera topic found: {camera_topic_ok}')
             if not camera_topic_ok:
                 _log('WARNING: Camera topic not found, recording without camera')
                 camera_ok = False
                 _active_recording['camera_ok'] = False
+
+            if camera_ok:
+                _log('Verifying camera frames are actually flowing...')
+                _active_recording['camera_frames'] = 0
+                _active_recording['_camera_frames_prev'] = 0
+                _active_recording['camera_streaming'] = False
+                camera_monitor_proc = _start_camera_monitor()
+                _active_recording['camera_monitor_proc'] = camera_monitor_proc
+                threading.Thread(
+                    target=_camera_monitor_reader, args=(camera_monitor_proc,),
+                    daemon=True,
+                ).start()
+                # Allow up to 3s for the first frame to land
+                deadline = time.time() + 3.0
+                while time.time() < deadline:
+                    if _active_recording['camera_frames'] > 0:
+                        break
+                    time.sleep(0.1)
+                if _active_recording['camera_frames'] == 0:
+                    _log('WARNING: No camera frames received in 3s — recording without camera')
+                    _kill_process_group(camera_monitor_proc)
+                    _active_recording['camera_monitor_proc'] = None
+                    camera_monitor_proc = None
+                    camera_ok = False
+                    _active_recording['camera_ok'] = False
+                else:
+                    _log(f'Camera streaming OK ({_active_recording["camera_frames"]} frames received)')
 
         # Build topic list
         topics = ['/unilidar/cloud', '/unilidar/imu']
@@ -712,13 +815,17 @@ def _recording_thread(session_id, session_name):
         _kill_process_group(driver_proc)
         _kill_process_group(camera_proc)
         _kill_process_group(tf_proc)
+        _kill_process_group(_active_recording.get('camera_monitor_proc'))
         _active_recording['driver_proc'] = None
         _active_recording['camera_proc'] = None
         _active_recording['tf_proc'] = None
         _active_recording['bag_proc'] = None
+        _active_recording['camera_monitor_proc'] = None
         _active_recording['session_id'] = None
         _active_recording['start_time'] = None
         _active_recording['camera_ok'] = False
+        _active_recording['camera_frames'] = 0
+        _active_recording['camera_streaming'] = False
     finally:
         _active_recording['starting'] = False
 
@@ -738,13 +845,16 @@ def api_record_stop():
         start_time = _active_recording['start_time']
         camera_ok = _active_recording['camera_ok']
 
-        # Stop bag recording
-        _kill_process_group(bag_proc)
+        # Stop bag recording first, giving MCAP time to flush footer + metadata.yaml.
+        # A premature SIGKILL here corrupts the bag (missing index, 0-byte metadata).
+        _kill_process_group(bag_proc, timeout=30)
 
-        # Stop driver and camera
+        # Stop driver, camera, and the camera monitor subscriber
+        camera_monitor_proc = _active_recording.get('camera_monitor_proc')
         _kill_process_group(driver_proc)
         _kill_process_group(camera_proc)
         _kill_process_group(tf_proc)
+        _kill_process_group(camera_monitor_proc)
 
         duration = round(time.time() - start_time, 1) if start_time else 0
 
@@ -782,7 +892,7 @@ def api_record_stop():
                     f.write(f"Topics: {' '.join(topics)}\n")
                     f.write(f"Camera: {'yes' if camera_ok else 'no'}\n")
                     if camera_ok:
-                        f.write(f"Camera resolution: {CAMERA_WIDTH}x{CAMERA_HEIGHT}@{CAMERA_FPS}fps\n")
+                        f.write(f"Camera resolution: {CAMERA_WIDTH}x{CAMERA_HEIGHT}@{CAMERA_FPS_CAPTURE}fps\n")
                         f.write(f"Intrinsics: {'calibrated' if os.path.isfile(INTRINSICS_FILE) else 'uncalibrated'}\n")
                         f.write(f"Extrinsics: {'calibrated' if os.path.isfile(EXTRINSICS_FILE) else 'uncalibrated'}\n")
                     f.write(f"Notes:\n")
@@ -798,23 +908,18 @@ def api_record_stop():
 
             _put_session(session_id, session)
 
-            # Extract MP4 from MCAP in background (if camera was active)
-            if camera_ok:
-                threading.Thread(
-                    target=_extract_mp4_from_mcap,
-                    args=(session_dir, session_id),
-                    daemon=True,
-                ).start()
-
         # Reset state
         _active_recording['session_id'] = None
         _active_recording['bag_proc'] = None
         _active_recording['driver_proc'] = None
         _active_recording['camera_proc'] = None
         _active_recording['tf_proc'] = None
+        _active_recording['camera_monitor_proc'] = None
         _active_recording['start_time'] = None
         _active_recording['starting'] = False
         _active_recording['camera_ok'] = False
+        _active_recording['camera_frames'] = 0
+        _active_recording['camera_streaming'] = False
 
         return jsonify({
             'session_id': session_id,
@@ -853,6 +958,7 @@ def api_camera_preview():
              '-c:v', 'copy', '-f', 'mjpeg', 'pipe:1'],
             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
         )
+        _active_preview['proc'] = proc
 
         try:
             buf = bytearray()
@@ -885,6 +991,8 @@ def api_camera_preview():
             except subprocess.TimeoutExpired:
                 proc.kill()
                 proc.wait(timeout=2)  # always reap to avoid holding /dev/video1
+            if _active_preview.get('proc') is proc:
+                _active_preview['proc'] = None
 
     return Response(generate(),
                     mimetype='multipart/x-mixed-replace; boundary=frame')
@@ -1740,6 +1848,7 @@ def _cleanup_on_exit():
     _kill_process_group(_active_recording.get('driver_proc'))
     _kill_process_group(_active_recording.get('camera_proc'))
     _kill_process_group(_active_recording.get('tf_proc'))
+    _kill_process_group(_active_recording.get('camera_monitor_proc'))
     if _active_calibration.get('proc'):
         _kill_process_group(_active_calibration['proc'])
 
