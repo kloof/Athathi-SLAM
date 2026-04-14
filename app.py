@@ -369,7 +369,7 @@ def _launch_camera():
         f'-p video_device:={CAMERA_DEVICE} '
         f'-p image_width:={CAMERA_WIDTH} '
         f'-p image_height:={CAMERA_HEIGHT} '
-        f'-p pixel_format:=mjpeg2rgb '
+        f'-p pixel_format:=raw_mjpeg '
         f'-p framerate:={float(CAMERA_FPS_CAPTURE)} '
         f'{camera_info_param}'
         f'-p autoexposure:=false '
