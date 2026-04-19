@@ -1,0 +1,9 @@
+# QoS override for `ros2 bag record`.
+# Publisher on /camera/image_raw/compressed is BEST_EFFORT (set in camera_node.py).
+# rosbag2's default sub is RELIABLE, which silently rejects BEST_EFFORT pubs.
+# This file makes the bag subscribe BEST_EFFORT so camera frames actually land.
+/camera/image_raw/compressed:
+  history: keep_last
+  depth: 10
+  reliability: best_effort
+  durability: volatile

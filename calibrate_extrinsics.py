@@ -28,6 +28,8 @@ import numpy as np
 import yaml
 from scipy.spatial.transform import Rotation
 
+from camera_config import lock_camera_controls
+
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 CALIBRATION_DIR = os.path.join(SCRIPT_DIR, 'calibration')
@@ -225,6 +227,7 @@ def capture_lidar_cloud(rclpy_node=None, timeout=5.0):
 
 def capture_camera_frame(device='/dev/video0', width=1280, height=720):
     """Capture a single camera frame."""
+    lock_camera_controls(device)
     cap = cv2.VideoCapture(device, cv2.CAP_V4L2)
     cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
@@ -420,6 +423,7 @@ def refine_interactive(K, D, device='/dev/video0'):
     step_r = 1.0    # 1 degree rotation step
 
     # Hold camera and rclpy node open for the entire session
+    lock_camera_controls(device)
     cap = cv2.VideoCapture(device, cv2.CAP_V4L2)
     cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)

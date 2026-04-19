@@ -21,6 +21,8 @@ import cv2
 import numpy as np
 import yaml
 
+from camera_config import lock_camera_controls
+
 
 # Checkerboard inner corners (one less than squares in each dimension)
 BOARD_ROWS = 7    # 8 squares - 1
@@ -102,6 +104,7 @@ def save_intrinsics(path, camera_matrix, dist_coeffs, width, height, reproj_erro
 
 def run_headless(device, width, height, output, square_size):
     """Headless auto-capture mode for web UI integration."""
+    lock_camera_controls(device)
     cap = cv2.VideoCapture(device, cv2.CAP_V4L2)
     cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
@@ -167,6 +170,7 @@ def run_headless(device, width, height, output, square_size):
 
 def run_interactive(device, width, height, output, square_size):
     """Interactive mode with live preview."""
+    lock_camera_controls(device)
     cap = cv2.VideoCapture(device, cv2.CAP_V4L2)
     cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)

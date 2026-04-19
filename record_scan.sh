@@ -164,16 +164,23 @@ if [ "$CAMERA_OK" = true ]; then
         CAMERA_INFO_URL="file://${CALIB_DIR}/intrinsics.yaml"
     fi
 
+    # Lock AE/AWB/AF via v4l2-ctl (single source of truth, matches app.py).
+    # Must flip auto flags off first — exposure/WB/focus targets are inactive
+    # until manual mode is engaged. Two calls in order.
+    v4l2-ctl -d "$CAMERA_DEVICE" \
+        --set-ctrl=auto_exposure=1,white_balance_automatic=0,focus_automatic_continuous=0 \
+        2>/dev/null || true
+    v4l2-ctl -d "$CAMERA_DEVICE" \
+        --set-ctrl=exposure_time_absolute=80,exposure_dynamic_framerate=0,gain=128,brightness=128,sharpness=64,power_line_frequency=1,white_balance_temperature=3500,focus_absolute=0 \
+        2>/dev/null || true
+
     ros2 run v4l2_camera v4l2_camera_node \
         --ros-args \
         -p video_device:=$CAMERA_DEVICE \
         -p "image_size:=[1280,720]" \
         -p pixel_format:=MJPG \
-        -p "time_per_frame:=[1,30]" \
+        -p "time_per_frame:=[1,15]" \
         -p "camera_info_url:=${CAMERA_INFO_URL}" \
-        -p auto_exposure:=1 \
-        -p exposure_time_absolute:=100 \
-        -p gain:=255 \
         -r __ns:=/camera &
     CAMERA_PID=$!
 

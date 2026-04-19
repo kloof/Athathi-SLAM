@@ -48,13 +48,13 @@ LIDAR_IP = '192.168.1.62'
 ROS_SETUP = '/opt/ros/humble/setup.bash'
 DRIVER_SETUP = '/home/talal/unilidar_sdk2/unitree_lidar_ros2/install/setup.bash'
 
-# Camera settings (Logitech Brio)
-CAMERA_DEVICE = '/dev/video0'
-CAMERA_WIDTH = 1280
-CAMERA_HEIGHT = 720
-CAMERA_FPS_CAPTURE = 30        # sensor/bag rate -- higher reduces rolling-shutter skew
-CAMERA_EXPOSURE_100US = 100  # 10 ms shutter -- still short, 2x brighter than 5 ms
-CAMERA_GAIN = 255  # 0-255, maxed analog gain
+# Camera settings (Logitech Brio) — shared with calibration tools
+from camera_config import (
+    CAMERA_DEVICE, CAMERA_WIDTH, CAMERA_HEIGHT, CAMERA_FPS_CAPTURE,
+    CAMERA_EXPOSURE_100US, CAMERA_GAIN, CAMERA_WB_KELVIN, CAMERA_FOCUS_ABS,
+    CAMERA_BRIGHTNESS, CAMERA_SHARPNESS, CAMERA_POWERLINE_HZ,
+    lock_camera_controls,
+)
 CALIBRATION_DIR = os.path.join(SCRIPT_DIR, 'calibration')
 INTRINSICS_FILE = os.path.join(CALIBRATION_DIR, 'intrinsics.yaml')
 EXTRINSICS_FILE = os.path.join(CALIBRATION_DIR, 'extrinsics.yaml')
@@ -307,6 +307,13 @@ def _set_brio_fov(fov=90):
         pass
 
 
+def _lock_camera_controls():
+    """Thin wrapper around camera_config.lock_camera_controls that logs readback."""
+    readback = lock_camera_controls(CAMERA_DEVICE)
+    if readback:
+        _log(f'camera lock: {readback.replace(chr(10), " | ")}')
+
+
 _CAMERA_STDERR_LOG = '/tmp/slam_camera_stderr.log'
 
 
@@ -343,14 +350,14 @@ def _release_camera_device(timeout=3.0):
 
 
 def _launch_camera():
-    """Launch the usb_cam ROS2 node for Brio.
+    """Launch the custom Brio ROS2 publisher (camera_node.py).
 
-    Switched from v4l2_camera_node (Humble/ARM cv_bridge::Exception on MJPG passthrough)
-    to usb_cam, which publishes the same `/camera/image_raw/compressed` topic via
-    image_transport and tolerates MJPG correctly. The `-r __ns:=/camera` remap puts
-    the node in the /camera namespace so its relative `image_raw` topic becomes
-    `/camera/image_raw`, and compressed_image_transport then creates
-    `/camera/image_raw/compressed` — matching what the bag recorder and monitor expect.
+    Replaces usb_cam, which on Humble/ARM64 with this Brio:
+      - raw_mjpeg: strips chroma → grayscale JPEGs
+      - mjpeg2rgb: crashes with 'Unable to exchange buffer with the driver'
+      - hardcodes brightness=50 on startup, overriding v4l2 locks
+    Our camera_node.py pipes ffmpeg MJPG out of /dev/video0 (which works
+    correctly) and republishes each JPEG as-is on /camera/image_raw/compressed.
     """
     _set_brio_fov(90)
 
@@ -358,25 +365,12 @@ def _launch_camera():
     if not _release_camera_device(timeout=3.0):
         _log(f'WARNING: {CAMERA_DEVICE} still busy after 3s; camera launch will likely fail')
 
-    camera_info_param = ''
-    if os.path.isfile(INTRINSICS_FILE):
-        camera_info_param = f'-p camera_info_url:="file://{INTRINSICS_FILE}" '
+    _lock_camera_controls()
 
+    camera_node_script = os.path.join(SCRIPT_DIR, 'camera_node.py')
     cmd = (
         f'source {ROS_SETUP} && '
-        f'ros2 run usb_cam usb_cam_node_exe '
-        f'--ros-args '
-        f'-p video_device:={CAMERA_DEVICE} '
-        f'-p image_width:={CAMERA_WIDTH} '
-        f'-p image_height:={CAMERA_HEIGHT} '
-        f'-p pixel_format:=raw_mjpeg '
-        f'-p framerate:={float(CAMERA_FPS_CAPTURE)} '
-        f'{camera_info_param}'
-        f'-p autoexposure:=false '
-        f'-p exposure:={CAMERA_EXPOSURE_100US} '
-        f'-p gain:={CAMERA_GAIN} '
-        f'-p frame_id:=camera_optical_frame '
-        f'-r __ns:=/camera '
+        f'python3 {camera_node_script}'
     )
     # Redirect stderr to a log file so failures are visible post-mortem rather
     # than trapped in an unread PIPE buffer.
@@ -452,6 +446,29 @@ sys.exit(1)
         return False
 
 
+def _trim_bag_to_sync_start(bag_dir, required_topics):
+    """Invoke trim_bag.py with ROS2 sourced (rosbag2_py not available in app.py env)."""
+    script = os.path.join(SCRIPT_DIR, 'trim_bag.py')
+    topics_arg = ' '.join(shlex.quote(t) for t in required_topics)
+    cmd = (
+        f'source {ROS_SETUP} && '
+        f'python3 {shlex.quote(script)} {shlex.quote(bag_dir)} {topics_arg}'
+    )
+    try:
+        result = subprocess.run(
+            cmd, shell=True, executable='/bin/bash',
+            capture_output=True, timeout=60, text=True
+        )
+        out = (result.stdout or '').strip()
+        err = (result.stderr or '').strip()
+        if out:
+            _log(out)
+        if err:
+            _log(f'trim stderr: {err}')
+    except Exception as e:
+        _log(f'trim: invocation failed: {e}')
+
+
 def _start_bag_record(output_dir, topics=None):
     """Start ros2 bag record process."""
     if topics is None:
@@ -459,12 +476,15 @@ def _start_bag_record(output_dir, topics=None):
     os.makedirs(output_dir, exist_ok=True)
     bag_path = os.path.join(output_dir, 'rosbag')
     topics_str = ' '.join(topics)
+    qos_override = os.path.join(SCRIPT_DIR, 'bag_qos_override.yaml')
+    qos_arg = f'--qos-profile-overrides-path {shlex.quote(qos_override)} ' if os.path.isfile(qos_override) else ''
     cmd = (
         f'source {ROS_SETUP} && '
         f'ros2 bag record '
         f'-o {shlex.quote(bag_path)} '
         f'--storage mcap '
         f'--max-cache-size 200000000 '
+        f'{qos_arg}'
         f'{topics_str}'
     )
     return subprocess.Popen(
@@ -769,14 +789,17 @@ def _recording_thread(session_id, session_name):
                     target=_camera_monitor_reader, args=(camera_monitor_proc,),
                     daemon=True,
                 ).start()
-                # Allow up to 3s for the first frame to land
-                deadline = time.time() + 3.0
+                # Allow up to 10s for the first frame to land. The monitor's FRAMES
+                # counter is only flushed on a 1s rclpy timer, and mjpeg2rgb's
+                # software-decode warm-up on Pi 4 can easily consume several seconds
+                # before first publish -- 3s was too tight.
+                deadline = time.time() + 10.0
                 while time.time() < deadline:
                     if _active_recording['camera_frames'] > 0:
                         break
                     time.sleep(0.1)
                 if _active_recording['camera_frames'] == 0:
-                    _log('WARNING: No camera frames received in 3s — recording without camera')
+                    _log('WARNING: No camera frames received in 10s — recording without camera')
                     _kill_process_group(camera_monitor_proc)
                     _active_recording['camera_monitor_proc'] = None
                     camera_monitor_proc = None
@@ -857,6 +880,19 @@ def api_record_stop():
         _kill_process_group(camera_monitor_proc)
 
         duration = round(time.time() - start_time, 1) if start_time else 0
+
+        # Trim leading single-sensor window so the bag starts with all
+        # required topics already live (cleaner for time-sync SLAM fusion).
+        session_preview = _get_session(session_id)
+        if session_preview and camera_ok:
+            bag_path_preview = os.path.join(
+                RECORDINGS_DIR, session_preview['name'], 'rosbag')
+            if os.path.isdir(bag_path_preview):
+                _trim_bag_to_sync_start(
+                    bag_path_preview,
+                    required_topics=['/unilidar/cloud',
+                                     '/camera/image_raw/compressed']
+                )
 
         # Update session
         session = _get_session(session_id)
@@ -939,14 +975,8 @@ def api_camera_preview():
         return jsonify({'error': 'No camera connected'}), 404
 
     def generate():
-        # Lock shutter + gain on the device so preview matches recording
-        subprocess.run(
-            ['v4l2-ctl', '-d', CAMERA_DEVICE,
-             f'--set-ctrl=auto_exposure=1,'
-             f'exposure_time_absolute={CAMERA_EXPOSURE_100US},'
-             f'gain={CAMERA_GAIN}'],
-            capture_output=True, timeout=2
-        )
+        # Lock AE/AWB/AF on the device so preview matches recording
+        _lock_camera_controls()
 
         # ffmpeg MJPG passthrough: camera emits JPEG, we forward bytes with
         # no decode/re-encode so CPU stays low even at 30 fps.

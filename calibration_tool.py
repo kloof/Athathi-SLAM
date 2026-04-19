@@ -28,6 +28,8 @@ import numpy as np
 import yaml
 from scipy.spatial.transform import Rotation
 
+from camera_config import lock_camera_controls
+
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer
 from PyQt5.QtGui import QImage, QPixmap, QKeySequence
 from PyQt5.QtWidgets import (
@@ -283,6 +285,7 @@ class LiveFeedWorker(QThread):
         if not dev:
             return None
         set_brio_fov(dev, 90)
+        lock_camera_controls(dev)
         time.sleep(0.2)
         cap = cv2.VideoCapture(dev, cv2.CAP_V4L2)
         if not cap.isOpened():
