@@ -253,6 +253,7 @@
                 }
                 banner.style.display = 'none';
                 btnStart.style.display = 'block';
+                btnStart.disabled = false;
                 btnStop.style.display = 'none';
                 nameInput.disabled = false;
                 stateEl.textContent = 'idle';
@@ -334,6 +335,7 @@
                 const d = await res.json();
                 if (!res.ok) alert(d.error || 'Failed to stop');
                 loadSessions();
+                checkStatus();
             } catch (e) {
                 alert('Network error: ' + e.message);
             } finally {
