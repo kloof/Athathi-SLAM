@@ -12,7 +12,6 @@ Usage:
 
 import argparse
 import atexit
-import gzip
 import json
 import os
 import re
@@ -23,12 +22,13 @@ import subprocess
 import sys
 import threading
 import time
+import uuid
 from datetime import datetime
 
 
 import cv2
 import yaml
-from flask import Flask, Response, jsonify, redirect, render_template, request, send_file
+from flask import Flask, Response, jsonify, render_template, request, send_file, stream_with_context
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -39,7 +39,13 @@ _USB_RECORDINGS = '/mnt/slam_data/recordings'
 RECORDINGS_DIR = _USB_RECORDINGS if os.path.isdir('/mnt/slam_data') else os.path.join(SCRIPT_DIR, 'recordings')
 SESSIONS_FILE = os.path.join(SCRIPT_DIR, 'sessions.json')
 
-SLAM_API_URL = 'https://slam-service-348149010358.us-central1.run.app'
+# Modal cloud-slam-icp endpoint. API key is loaded from .env (see _load_env_file).
+MODAL_API_URL = 'https://tiktokredditkw--cloud-slam-icp-web.modal.run'
+# Where Modal-derived results are stored (separate from raw .mcap recordings).
+_USB_PROCESSED = '/mnt/slam_data/processed'
+PROCESSED_DIR = _USB_PROCESSED if os.path.isdir('/mnt/slam_data') else os.path.join(SCRIPT_DIR, 'processed')
+# Default poll cadence when the Modal `Retry-After` header is absent.
+POLL_INTERVAL_S = 3
 
 IFACE = 'eth0'
 HOST_IP = '192.168.1.2'
@@ -65,6 +71,63 @@ _LOG_FILE = '/tmp/slam_app_debug.log'
 def _log(msg):
     with open(_LOG_FILE, 'a') as f:
         f.write(f'{datetime.now().isoformat()} {msg}\n')
+
+
+# ---------------------------------------------------------------------------
+# .env loader (no external dep)
+# ---------------------------------------------------------------------------
+
+def _load_env_file(path):
+    """Parse a tiny KEY=value `.env` file and return a dict.
+
+    Grammar:
+      - Lines starting with `#` are ignored.
+      - Blank lines are ignored.
+      - `KEY=value`, `KEY="value"`, `KEY='value'` all supported (surrounding
+        quotes stripped, but only matched pairs).
+      - CRLF tolerated (line is rstripped).
+      - No shell expansion; no nested quotes.
+
+    Missing file → empty dict (no exception).
+    """
+    out = {}
+    if not os.path.isfile(path):
+        return out
+    try:
+        with open(path, 'r') as f:
+            for raw in f:
+                line = raw.rstrip('\r\n').strip()
+                if not line or line.startswith('#'):
+                    continue
+                if '=' not in line:
+                    continue
+                key, _, val = line.partition('=')
+                key = key.strip()
+                val = val.strip()
+                if not key:
+                    continue
+                # Strip matching surrounding quotes only.
+                if len(val) >= 2 and val[0] == val[-1] and val[0] in ('"', "'"):
+                    val = val[1:-1]
+                out[key] = val
+    except OSError:
+        return out
+    return out
+
+
+_ENV = _load_env_file(os.path.join(SCRIPT_DIR, '.env'))
+MODAL_API_KEY = _ENV.get('MODAL_API', '')
+if not MODAL_API_KEY:
+    print('WARNING: MODAL_API not set in .env — /api/session/<id>/process '
+          'will return 503. Recording and calibration still work.',
+          file=sys.stderr)
+
+# zstd availability is checked at boot. If missing, /process returns 503.
+_ZSTD_BIN = shutil.which('zstd')
+if not _ZSTD_BIN:
+    print('WARNING: `zstd` binary not found on PATH — /api/session/<id>/process '
+          'will return 503. Install with `apt install zstd`.',
+          file=sys.stderr)
 
 # ---------------------------------------------------------------------------
 # Session persistence
@@ -668,17 +731,10 @@ def api_sessions():
             )
             bag_size = f'{total / (1024*1024):.1f} MB'
 
-        slam_result = s.get('slam_result')
-        slam_info = None
-        if slam_result:
-            slam_info = {
-                'num_points': slam_result.get('num_points'),
-                'bounding_box': slam_result.get('bounding_box_m'),
-                'slam_time': slam_result.get('slam_time_s'),
-                'total_time': slam_result.get('total_time_s'),
-                'download_url': slam_result.get('download_url'),
-                'job_id': slam_result.get('job_id'),
-            }
+        # Build a small summary from the persisted result envelope so the
+        # session list is cheap to render. The full envelope is fetched
+        # on-demand via /api/session/<id>/result.
+        result_summary = _result_summary_from_session(s)
 
         result.append({
             'id': sid,
@@ -689,14 +745,45 @@ def api_sessions():
             'duration': s.get('duration'),
             'scp_path': os.path.join(RECORDINGS_DIR, s['name']),
             'slam_status': s.get('slam_status'),
-            'slam_result': slam_info,
+            'slam_stage': s.get('slam_stage'),
             'slam_error': s.get('slam_error'),
-            'floorplan_status': s.get('floorplan_status'),
-            'floorplan_meta': s.get('floorplan_meta'),
-            'floorplan_error': s.get('floorplan_error'),
-            'floorplan_candidates': s.get('floorplan_candidates'),
+            'job_id': s.get('job_id'),
+            'result_summary': result_summary,
         })
     return jsonify(result)
+
+
+def _result_summary_from_session(session):
+    """Compute the small headline-numbers summary shown on each session card.
+
+    Source of truth is the on-disk `processed/<name>/result.json` (so a
+    re-process refreshes it), but we fall back to whatever's stored on the
+    session record if the file is missing.
+    """
+    envelope = None
+    name = session.get('name')
+    if name:
+        result_path = os.path.join(_processed_dir_for_session(name),
+                                   'result.json')
+        if os.path.isfile(result_path):
+            try:
+                with open(result_path, 'r') as f:
+                    envelope = json.load(f)
+            except (OSError, json.JSONDecodeError):
+                envelope = None
+    if envelope is None:
+        envelope = session.get('slam_result')
+    if not envelope or not isinstance(envelope, dict):
+        return None
+    fp = envelope.get('floorplan') or {}
+    metrics = envelope.get('metrics') or {}
+    return {
+        'num_walls': len(fp.get('walls') or []),
+        'num_doors': len(fp.get('doors') or []),
+        'num_windows': len(fp.get('windows') or []),
+        'num_furniture': len(envelope.get('furniture') or []),
+        'total_duration_s': metrics.get('total_duration_s'),
+    }
 
 
 @app.route('/api/record/start', methods=['POST'])
@@ -1217,21 +1304,44 @@ def api_set_extrinsics():
 
 @app.route('/api/session/<session_id>', methods=['DELETE'])
 def api_delete_session(session_id):
-    """Delete a recording session and its files."""
+    """Delete a recording session and its files.
+
+    If the session is mid-processing, fire the cancel Event and wait up to 5 s
+    for the worker thread to clear `_active_processing`. The worker is
+    responsible for telling Modal to free its container (via _modal_cancel).
+    Local files are then removed unconditionally.
+    """
     session = _get_session(session_id)
     if not session:
         return jsonify({'error': 'Session not found'}), 404
 
-    # Don't delete active recording or processing session
+    # Don't delete active recording.
     if _active_recording['session_id'] == session_id:
         return jsonify({'error': 'Cannot delete active recording'}), 409
-    if session_id in _active_processing:
-        return jsonify({'error': 'Cannot delete while processing'}), 409
 
-    # Remove files
+    # If a processing job is active, ask it to cancel and wait briefly.
+    with _processing_lock:
+        entry = _active_processing.get(session_id)
+        if entry is not None:
+            ev = entry.get('cancel')
+            if ev is not None:
+                ev.set()
+    if entry is not None:
+        deadline = time.time() + 5.0
+        while time.time() < deadline:
+            with _processing_lock:
+                if session_id not in _active_processing:
+                    break
+            time.sleep(0.1)
+
+    # Remove raw recording files.
     session_dir = os.path.join(RECORDINGS_DIR, session['name'])
     if os.path.isdir(session_dir):
         shutil.rmtree(session_dir, ignore_errors=True)
+    # Remove processed results.
+    processed_dir = _processed_dir_for_session(session['name'])
+    if os.path.isdir(processed_dir):
+        shutil.rmtree(processed_dir, ignore_errors=True)
 
     _delete_session(session_id)
     return jsonify({'deleted': session_id})
@@ -1253,13 +1363,21 @@ def api_events():
                 session = _get_session(session_id) if session_id else None
                 status = session.get('status', 'recording') if session else 'recording'
 
-            # Collect processing status for active SLAM jobs
+            # Collect processing status for active SLAM jobs.
+            # Snapshot under lock so we don't race with _process_thread.
             processing = {}
-            for sid, proc in dict(_active_processing).items():
+            with _processing_lock:
+                snapshot = {sid: dict(proc) for sid, proc in _active_processing.items()}
+            for sid, proc in snapshot.items():
+                stage = proc.get('stage') or proc.get('status') or ''
                 processing[sid] = {
-                    'status': proc['status'],
-                    'progress': proc['progress'],
-                    'elapsed': round(time.time() - proc['start_time'], 1),
+                    'status': proc.get('status'),
+                    'stage': stage,
+                    # `progress` is kept as a human string for back-compat
+                    # with old browser tabs that read procInfo.progress.
+                    'progress': stage,
+                    'job_id': proc.get('job_id'),
+                    'elapsed': round(time.time() - proc.get('start_time', time.time()), 1),
                 }
 
             data = json.dumps({
@@ -1277,8 +1395,35 @@ def api_events():
 
 
 # ---------------------------------------------------------------------------
-# SLAM Cloud API
+# SLAM via Modal cloud-slam-icp (async API)
 # ---------------------------------------------------------------------------
+#
+# Pipeline:
+#   1. zstd-compress the .mcap to scan.mcap.zst (next to the source).
+#   2. POST /jobs?filename=scan.mcap.zst with X-API-Key + X-Idempotency-Key.
+#   3. Poll GET /jobs/{id} until status is `done` or `failed`.
+#   4. On done: pull result.json + layout_merged.txt + best_views/<idx>.jpg
+#      into PROCESSED_DIR/<session_name>/. PLY artifacts stay remote and are
+#      surfaced via the Flask proxy at /api/session/<id>/artifact/<name>.
+#
+# Cancellation is implemented with a threading.Event stored on each
+# `_active_processing[sid]` entry, so the poller's `event.wait(retry_after_s)`
+# wakes immediately when the user hits Delete on a running session.
+
+# Network-error retry counts.
+_MODAL_SUBMIT_RETRIES = 3            # 1, 2, 4 s exponential backoff between tries.
+_MODAL_POLL_MAX_FAILURES = 5         # Consecutive poll failures before aborting.
+
+# Whitelist of artifacts the proxy will stream from Modal. A request for
+# anything else returns 404; this keeps user-controlled paths from
+# wandering the Modal volume.
+_ARTIFACT_WHITELIST = frozenset({
+    'colored_map.ply',
+    'scene_with_boxes.ply',
+    'result.json',
+    'layout_merged.txt',
+})
+
 
 def _find_mcap(session):
     """Find the MCAP file for a session."""
@@ -1291,616 +1436,597 @@ def _find_mcap(session):
     return None
 
 
-DIRECT_UPLOAD_LIMIT = 30 * 1024 * 1024   # 30 MB — use GCS path for larger files
-COMPRESS_THRESHOLD = 200 * 1024 * 1024   # 200 MB — only gzip files larger than this
+def _processed_dir_for_session(session_name):
+    """Return the processed/<name>/ directory, with a mid-run mount fallback.
+
+    If the boot-time PROCESSED_DIR was on `/mnt/slam_data` but the flash drive
+    has since unmounted, we fall back to the in-repo `processed/` directory
+    so a long Modal job doesn't lose its output.
+    """
+    if PROCESSED_DIR.startswith('/mnt/slam_data') and not os.path.ismount('/mnt/slam_data'):
+        fallback = os.path.join(SCRIPT_DIR, 'processed', session_name)
+        return fallback
+    return os.path.join(PROCESSED_DIR, session_name)
 
 
-def _process_thread(session_id, mcap_path, voxel_size):
-    """Background thread: upload MCAP to cloud API, store result."""
-    gz_path = None
-    slam_succeeded = False
+def _zstd_compress(src_mcap, dst_path):
+    """Compress `src_mcap` to `dst_path` with `zstd -1 -q`.
+
+    Returns the destination path on success. Raises RuntimeError on a
+    non-zero exit (with a stderr tail in the message).
+    """
+    if not _ZSTD_BIN:
+        raise RuntimeError('zstd not installed')
+    res = subprocess.run(
+        [_ZSTD_BIN, '-1', '-q', '-f', '-o', dst_path, src_mcap],
+        capture_output=True, text=True,
+    )
+    if res.returncode != 0:
+        tail = (res.stderr or '').strip()[-300:]
+        raise RuntimeError(f'compression failed: {tail}')
+    return dst_path
+
+
+def _modal_submit(zst_path, idem_key):
+    """POST `zst_path` to /jobs with X-API-Key and X-Idempotency-Key.
+
+    Returns the new job_id. Retries up to _MODAL_SUBMIT_RETRIES times on
+    HTTP 5xx / network failure with exponential backoff (1, 2, 4 s).
+    Reuses the same idempotency key across retries so we don't double-submit.
+    """
+    url = f'{MODAL_API_URL}/jobs?filename=scan.mcap.zst'
+    last_err = None
+    for attempt in range(_MODAL_SUBMIT_RETRIES):
+        if attempt > 0:
+            time.sleep(2 ** (attempt - 1))   # 1, 2, 4
+        try:
+            res = subprocess.run(
+                ['curl', '-sS', '-X', 'POST',
+                 '-H', f'X-API-Key: {MODAL_API_KEY}',
+                 '-H', f'X-Idempotency-Key: {idem_key}',
+                 '-H', 'Content-Type: application/zstd',
+                 '--data-binary', f'@{zst_path}',
+                 '-w', '\n%{http_code}',
+                 url],
+                capture_output=True, text=True, timeout=900,
+            )
+        except subprocess.TimeoutExpired as e:
+            last_err = f'submit timeout: {e}'
+            continue
+        if res.returncode != 0:
+            last_err = f'curl rc={res.returncode}: {(res.stderr or "")[:200]}'
+            continue
+        body, _, code = (res.stdout or '').rpartition('\n')
+        try:
+            http_code = int(code.strip())
+        except ValueError:
+            last_err = f'unparsable status line: {res.stdout[:200]!r}'
+            continue
+        if 500 <= http_code < 600:
+            last_err = f'HTTP {http_code}: {body[:200]}'
+            continue
+        if http_code >= 400:
+            raise RuntimeError(f'submit HTTP {http_code}: {body[:200]}')
+        try:
+            payload = json.loads(body)
+        except json.JSONDecodeError:
+            raise RuntimeError(f'submit returned non-JSON: {body[:200]!r}')
+        job_id = payload.get('job_id') or payload.get('id')
+        if not job_id:
+            raise RuntimeError(f'submit response missing job_id: {body[:200]}')
+        return job_id
+    raise RuntimeError(f'submit failed after {_MODAL_SUBMIT_RETRIES} tries: {last_err}')
+
+
+def _modal_poll(job_id):
+    """GET /jobs/{job_id}. Returns (envelope_dict, retry_after_seconds).
+
+    `retry_after_seconds` is parsed from the `Retry-After` response header and
+    falls back to POLL_INTERVAL_S when absent. Raises on non-2xx / curl error.
+    """
+    url = f'{MODAL_API_URL}/jobs/{job_id}'
+    res = subprocess.run(
+        ['curl', '-sS', '-D', '-',
+         '-H', f'X-API-Key: {MODAL_API_KEY}',
+         url],
+        capture_output=True, text=True, timeout=60,
+    )
+    if res.returncode != 0:
+        raise RuntimeError(f'poll curl rc={res.returncode}: {(res.stderr or "")[:200]}')
+
+    raw = res.stdout or ''
+    # Split header block from body. With `-D -` headers come before body
+    # separated by a blank line. Curl may emit multiple header blocks for
+    # redirects; take the last one.
+    head, _, body = raw.rpartition('\r\n\r\n')
+    if not head:
+        head, _, body = raw.rpartition('\n\n')
+    status_code = None
+    retry_after = POLL_INTERVAL_S
+    for line in head.splitlines():
+        s = line.strip()
+        if s.upper().startswith('HTTP/'):
+            parts = s.split()
+            if len(parts) >= 2 and parts[1].isdigit():
+                status_code = int(parts[1])
+        elif s.lower().startswith('retry-after:'):
+            v = s.split(':', 1)[1].strip()
+            try:
+                retry_after = max(1, int(float(v)))
+            except (ValueError, TypeError):
+                pass
+    if status_code is None:
+        raise RuntimeError(f'poll: could not parse HTTP status from {raw[:200]!r}')
+    if status_code >= 500:
+        raise RuntimeError(f'poll HTTP {status_code}')
+    if status_code >= 400:
+        raise RuntimeError(f'poll HTTP {status_code}: {body[:200]}')
     try:
-        mcap_size = os.path.getsize(mcap_path)
+        envelope = json.loads(body)
+    except json.JSONDecodeError as e:
+        raise RuntimeError(f'poll body not JSON: {e}; body={body[:200]!r}')
+    return envelope, retry_after
 
-        _active_processing[session_id] = {
-            'status': 'uploading',
-            'start_time': time.time(),
-            'progress': f'Uploading {mcap_size / (1024*1024):.0f} MB...',
-        }
 
-        session = _get_session(session_id)
-        session['status'] = 'processing'
-        session['slam_status'] = 'uploading'
-        _put_session(session_id, session)
+def _modal_cancel(job_id):
+    """Best-effort DELETE /jobs/{job_id}. Errors are logged, never raised."""
+    if not job_id:
+        return
+    try:
+        subprocess.run(
+            ['curl', '-sS', '-X', 'DELETE',
+             '-H', f'X-API-Key: {MODAL_API_KEY}',
+             f'{MODAL_API_URL}/jobs/{job_id}'],
+            capture_output=True, text=True, timeout=30,
+        )
+    except Exception as e:
+        _log(f'_modal_cancel({job_id}) failed: {e}')
 
-        # Only compress very large files (>200 MB)
-        if mcap_size > COMPRESS_THRESHOLD:
-            _active_processing[session_id]['status'] = 'compressing'
-            _active_processing[session_id]['progress'] = f'Compressing {mcap_size / (1024*1024):.0f} MB...'
-            session['slam_status'] = 'compressing'
-            _put_session(session_id, session)
 
-            gz_path = mcap_path + '.gz'
-            with open(mcap_path, 'rb') as f_in, gzip.open(gz_path, 'wb') as f_out:
-                shutil.copyfileobj(f_in, f_out)
+def _modal_fetch(job_id, path, dest):
+    """GET an artifact or image to `dest` via curl. `path` is e.g. `image/3`
+    or `artifact/result.json`. Always sends X-API-Key.
+    """
+    url = f'{MODAL_API_URL}/jobs/{job_id}/{path}'
+    os.makedirs(os.path.dirname(dest), exist_ok=True)
+    res = subprocess.run(
+        ['curl', '-sSf', '-L',
+         '-H', f'X-API-Key: {MODAL_API_KEY}',
+         '-o', dest, url],
+        capture_output=True, text=True, timeout=300,
+    )
+    if res.returncode != 0:
+        raise IOError(f'fetch {path} failed: rc={res.returncode}: {(res.stderr or "")[:200]}')
+    if not os.path.isfile(dest) or os.path.getsize(dest) == 0:
+        raise IOError(f'fetch {path} produced empty file at {dest}')
+    return dest
 
-            upload_path = gz_path
-            upload_size = os.path.getsize(gz_path)
-            upload_filename = 'scan.mcap.gz'
-        else:
-            upload_path = mcap_path
-            upload_size = mcap_size
-            upload_filename = 'scan.mcap'
 
-        _active_processing[session_id]['status'] = 'uploading'
-        _active_processing[session_id]['progress'] = f'Uploading {upload_size / (1024*1024):.0f} MB...'
-        session = _get_session(session_id)
-        session['slam_status'] = 'uploading'
-        _put_session(session_id, session)
+# ---------------------------------------------------------------------------
 
-        if upload_size <= DIRECT_UPLOAD_LIMIT:
-            result = _upload_direct(upload_path, upload_filename, voxel_size)
-        else:
-            result = _upload_via_gcs(upload_path, voxel_size, session_id)
+def _process_thread(session_id, mcap_path):
+    """Background worker for a Modal SLAM job.
 
-        # Store result in session
-        session = _get_session(session_id)
-        session['status'] = 'processed'
-        session['slam_status'] = 'done'
-        session['slam_result'] = result
-        _put_session(session_id, session)
+    Lifecycle (all `_active_processing[session_id]` mutations under
+    `_processing_lock`):
+      1. Pre-submit cancel check.
+      2. zstd-compress the .mcap to scan.mcap.zst (next to the source).
+      3. Generate fresh idempotency key, persist on session.
+      4. Submit; record job_id on both `_active_processing[sid]` and the
+         session record.
+      5. Poll loop. `cancel.is_set()` mid-loop → DELETE /jobs/{id} and bail.
+      6. On `done`: download result.json → layout_merged.txt → best_views/.
+      7. `finally`: remove the .zst, pop the active-processing entry, clear
+         `idem_key` on the session.
+    """
+    sess0 = _get_session(session_id) or {}
+    proc_dir = _processed_dir_for_session(sess0.get('name', session_id))
+    os.makedirs(proc_dir, exist_ok=True)
+    zst_path = os.path.join(proc_dir, 'scan.mcap.zst')
+    job_id = None
+    try:
+        # Step 1: Pre-submit cancel check.
+        with _processing_lock:
+            entry = _active_processing.get(session_id)
+            if entry is None:
+                return
+            cancel_event = entry['cancel']
 
-        slam_succeeded = True
+        if cancel_event.is_set():
+            _set_session_slam_status(session_id, 'cancelled')
+            return
+
+        # Step 2: Compress.
+        _set_active_stage(session_id, 'compressing')
+        _set_session_slam_status(session_id, 'compressing')
+        try:
+            _zstd_compress(mcap_path, zst_path)
+        except Exception as e:
+            _set_session_slam_error(session_id, str(e))
+            return
+
+        if cancel_event.is_set():
+            _set_session_slam_status(session_id, 'cancelled')
+            return
+
+        # Step 3: Submit with a fresh idempotency key.
+        idem_key = uuid.uuid4().hex
+        sess = _get_session(session_id) or {}
+        sess['idem_key'] = idem_key
+        # Wipe stale slam fields from a previous run.
+        sess.pop('slam_error', None)
+        sess.pop('slam_result', None)
+        sess['slam_status'] = 'uploading'
+        sess['slam_stage'] = 'uploading'
+        _put_session(session_id, sess)
+
+        _set_active_stage(session_id, 'uploading')
+
+        try:
+            job_id = _modal_submit(zst_path, idem_key)
+        except Exception as e:
+            _set_session_slam_error(session_id, f'submit: {e}')
+            return
+
+        with _processing_lock:
+            entry = _active_processing.get(session_id)
+            if entry is not None:
+                entry['job_id'] = job_id
+                entry['stage'] = 'queued'
+        sess = _get_session(session_id) or {}
+        sess['job_id'] = job_id
+        sess['slam_status'] = 'queued'
+        sess['slam_stage'] = 'queued'
+        sess['submitted_at'] = datetime.utcnow().isoformat() + 'Z'
+        _put_session(session_id, sess)
+
+        # Step 4-5: Poll loop.
+        consecutive_failures = 0
+        retry_after = POLL_INTERVAL_S
+        while True:
+            # `event.wait` returns True the moment cancel is fired.
+            if cancel_event.wait(retry_after):
+                _modal_cancel(job_id)
+                _set_session_slam_status(session_id, 'cancelled')
+                return
+
+            try:
+                envelope, retry_after = _modal_poll(job_id)
+                consecutive_failures = 0
+            except Exception as e:
+                consecutive_failures += 1
+                _log(f'_modal_poll failed ({consecutive_failures}/{_MODAL_POLL_MAX_FAILURES}): {e}')
+                if consecutive_failures >= _MODAL_POLL_MAX_FAILURES:
+                    _set_session_slam_error(
+                        session_id, f'poll failed after {consecutive_failures} tries: {e}')
+                    return
+                retry_after = max(retry_after, POLL_INTERVAL_S)
+                continue
+
+            stage = envelope.get('status', 'unknown')
+
+            # Mirror stage so SSE shows e.g. `stage_5_infer`.
+            _set_active_stage(session_id, stage)
+            sess = _get_session(session_id) or {}
+            sess['slam_status'] = stage
+            sess['slam_stage'] = stage
+            _put_session(session_id, sess)
+
+            if stage == 'failed':
+                err = envelope.get('error') or {}
+                err_stage = err.get('stage') or 'unknown'
+                err_tail = err.get('stderr_tail') or err.get('message') or ''
+                _set_session_slam_error(
+                    session_id, f'{err_stage}: {err_tail}')
+                return
+
+            if stage == 'done':
+                _save_done_artifacts(session_id, job_id, envelope)
+                return
+
+            # Otherwise it's an in-progress stage; keep polling.
+            continue
 
     except Exception as e:
-        session = _get_session(session_id)
-        if session:
-            session['status'] = 'stopped'
-            session['slam_status'] = 'error'
-            session['slam_error'] = str(e)
-            _put_session(session_id, session)
+        _log(f'_process_thread crashed for {session_id}: {e}')
+        _set_session_slam_error(session_id, f'internal: {e}')
     finally:
-        # Clean up gz file if we created one
-        if gz_path:
-            try:
-                os.remove(gz_path)
-            except OSError:
-                pass
-
-        if slam_succeeded:
-            # Auto-trigger wall detection — transition the
-            # _active_processing entry to floorplan status (no gap)
-            _active_processing[session_id] = {
-                'status': 'floorplan',
-                'start_time': time.time(),
-                'progress': 'Detecting walls...',
-            }
-            thread = threading.Thread(
-                target=_detect_walls_thread,
-                args=(session_id,),
-                daemon=True,
-            )
-            thread.start()
-        else:
+        # Always clean up the .zst and the active-processing entry.
+        try:
+            if os.path.isfile(zst_path):
+                os.remove(zst_path)
+        except OSError:
+            pass
+        with _processing_lock:
             _active_processing.pop(session_id, None)
+        sess = _get_session(session_id)
+        if sess and 'idem_key' in sess:
+            sess.pop('idem_key', None)
+            _put_session(session_id, sess)
 
 
-def _upload_direct(file_path, filename, voxel_size):
-    """Upload MCAP directly to /api/slam."""
-    url = f'{SLAM_API_URL}/api/slam'
-    if voxel_size:
-        url += f'?voxel_size={voxel_size}'
-
-    curl_result = subprocess.run(
-        ['curl', '-s', '-X', 'POST',
-         '-F', f'file=@{file_path};filename={filename}',
-         url],
-        capture_output=True, text=True, timeout=660,
-    )
-
-    if curl_result.returncode != 0:
-        raise RuntimeError(f'curl failed: {curl_result.stderr[:200]}')
-
-    return json.loads(curl_result.stdout)
+def _set_active_stage(session_id, stage):
+    """Mirror a status string into `_active_processing[sid]['stage']`."""
+    with _processing_lock:
+        entry = _active_processing.get(session_id)
+        if entry is not None:
+            entry['stage'] = stage
 
 
-def _upload_via_gcs(file_path, voxel_size, session_id):
-    """Upload large file to GCS, then trigger processing via /api/slam/from-gcs."""
-    # Step 1: Get upload URL / blob name from API
-    upload_info_result = subprocess.run(
-        ['curl', '-s', f'{SLAM_API_URL}/api/upload-url'],
-        capture_output=True, text=True, timeout=30,
-    )
-    if upload_info_result.returncode != 0:
-        raise RuntimeError(f'Failed to get upload URL: {upload_info_result.stderr[:200]}')
+def _set_session_slam_status(session_id, status):
+    """Persist `slam_status` on the session record."""
+    sess = _get_session(session_id)
+    if not sess:
+        return
+    sess['slam_status'] = status
+    sess['slam_stage'] = status
+    _put_session(session_id, sess)
 
-    upload_info = json.loads(upload_info_result.stdout)
-    blob_name = upload_info['blob_name']
-    bucket = upload_info['bucket']
-    gcs_uri = f'gs://{bucket}/{blob_name}'
 
-    _active_processing[session_id]['progress'] = f'Uploading to GCS ({os.path.getsize(file_path) / (1024*1024):.0f} MB)...'
+def _set_session_slam_error(session_id, message):
+    """Persist a SLAM error message on the session record."""
+    sess = _get_session(session_id)
+    if not sess:
+        return
+    sess['slam_status'] = 'error'
+    sess['slam_stage'] = 'error'
+    sess['slam_error'] = message
+    _put_session(session_id, sess)
 
-    # Step 2: Upload file to GCS via gsutil (run as talal for credentials)
-    gsutil_result = subprocess.run(
-        ['sudo', '-u', 'talal', 'gsutil', 'cp', file_path, gcs_uri],
-        capture_output=True, text=True, timeout=600,
-    )
-    if gsutil_result.returncode != 0:
-        raise RuntimeError(f'gsutil upload failed: {gsutil_result.stderr[:300]}')
 
-    _active_processing[session_id]['status'] = 'processing'
-    _active_processing[session_id]['progress'] = 'Processing on cloud...'
+def _save_done_artifacts(session_id, job_id, envelope):
+    """Persist a `done` envelope locally.
 
-    # Step 3: Trigger processing via /api/slam/from-gcs
-    process_url = f'{SLAM_API_URL}/api/slam/from-gcs?blob_name={blob_name}'
-    if voxel_size:
-        process_url += f'&voxel_size={voxel_size}'
+    Order matters: `result.json` first (the floorplan SVG render needs only
+    this), then `layout_merged.txt`, then per-bbox best_views. Per-image
+    IOError is logged and skipped so a partial gallery still ships when the
+    disk fills up. The best_views directory is wiped first to avoid stale
+    files leaking into a re-process.
+    """
+    sess = _get_session(session_id) or {}
+    name = sess.get('name', session_id)
+    proc_dir = _processed_dir_for_session(name)
+    os.makedirs(proc_dir, exist_ok=True)
 
-    process_result = subprocess.run(
-        ['curl', '-s', '-X', 'POST', process_url],
-        capture_output=True, text=True, timeout=660,
-    )
+    # 1. result.json (most useful — floorplan/furniture geometry).
+    result_path = os.path.join(proc_dir, 'result.json')
+    try:
+        with open(result_path, 'w') as f:
+            json.dump(envelope, f, indent=2)
+    except IOError as e:
+        _log(f'failed to write result.json for {session_id}: {e}')
 
-    if process_result.returncode != 0:
-        raise RuntimeError(f'Processing request failed: {process_result.stderr[:200]}')
+    # 2. layout_merged.txt.
+    layout_path = os.path.join(proc_dir, 'layout_merged.txt')
+    try:
+        _modal_fetch(job_id, 'artifact/layout_merged.txt', layout_path)
+    except IOError as e:
+        _log(f'failed to fetch layout_merged.txt for {session_id}: {e}')
 
-    return json.loads(process_result.stdout)
+    # 3. best_views — wipe first to avoid leak from a previous run.
+    bv_dir = os.path.join(proc_dir, 'best_views')
+    shutil.rmtree(bv_dir, ignore_errors=True)
+    os.makedirs(bv_dir, exist_ok=True)
+    best_images = envelope.get('best_images') or []
+    for idx, _bbox in enumerate(best_images):
+        dest = os.path.join(bv_dir, f'{idx}.jpg')
+        try:
+            _modal_fetch(job_id, f'image/{idx}', dest)
+        except IOError as e:
+            _log(f'failed to fetch image {idx} for {session_id}: {e}')
+
+    # Persist completion on the session.
+    sess = _get_session(session_id) or {}
+    sess['status'] = 'processed'
+    sess['slam_status'] = 'done'
+    sess['slam_stage'] = 'done'
+    sess['slam_result'] = envelope
+    sess.pop('slam_error', None)
+    _put_session(session_id, sess)
 
 
 @app.route('/api/session/<session_id>/process', methods=['POST'])
 def api_process(session_id):
-    """Upload session MCAP to SLAM Cloud API for processing."""
+    """Submit the session's MCAP to Modal for SLAM + layout + best-views."""
+    if not MODAL_API_KEY:
+        return jsonify({'error': 'MODAL_API not configured on server'}), 503
+    if not _ZSTD_BIN:
+        return jsonify({'error': 'zstd not installed on server'}), 503
+
     session = _get_session(session_id)
     if not session:
         return jsonify({'error': 'Session not found'}), 404
 
+    mcap_path = _find_mcap(session)
+    if not mcap_path:
+        return jsonify({'error': 'No MCAP file found for session'}), 404
+
+    # Insert the active-processing entry under lock BEFORE spawning the
+    # thread (matches the existing recording-start pattern). This way two
+    # concurrent /process requests can't both succeed in racing the worker.
     with _processing_lock:
         if session_id in _active_processing:
             return jsonify({'error': 'Already processing'}), 409
         _active_processing[session_id] = {
-            'status': 'uploading', 'start_time': time.time(),
-            'progress': 'Starting...',
+            'status': 'processing',
+            'stage': 'compressing',
+            'start_time': time.time(),
+            'cancel': threading.Event(),
+            'job_id': None,
         }
 
-    mcap_path = _find_mcap(session)
-    if not mcap_path:
-        _active_processing.pop(session_id, None)
-        return jsonify({'error': 'No MCAP file found for session'}), 404
-
-    data = request.get_json(force=True, silent=True) or {}
-    voxel_size = data.get('voxel_size')
+    # Mark the session record up front so the UI flips immediately.
+    session['status'] = 'processing'
+    session['slam_status'] = 'compressing'
+    session['slam_stage'] = 'compressing'
+    session.pop('slam_error', None)
+    _put_session(session_id, session)
 
     thread = threading.Thread(
         target=_process_thread,
-        args=(session_id, mcap_path, voxel_size),
+        args=(session_id, mcap_path),
         daemon=True,
     )
     thread.start()
 
-    return jsonify({'session_id': session_id, 'status': 'started'})
+    return jsonify({
+        'session_id': session_id,
+        'status': 'started',
+        'job_id_pending': True,
+    })
 
 
 @app.route('/api/session/<session_id>/result')
 def api_result(session_id):
-    """Get SLAM processing result for a session."""
+    """Return a unified result envelope for the session.
+
+    Shape: `{status, stage, elapsed, error?, result?}`. `result` (the full
+    Modal envelope) is populated only when slam_status == 'done'.
+    """
     session = _get_session(session_id)
     if not session:
         return jsonify({'error': 'Session not found'}), 404
 
-    # Check if currently processing
-    if session_id in _active_processing:
-        proc = _active_processing[session_id]
-        elapsed = round(time.time() - proc['start_time'], 1)
+    # Active job: read from the in-memory entry so we don't miss the most
+    # recent stage transition that hasn't been persisted yet.
+    with _processing_lock:
+        entry = _active_processing.get(session_id)
+        if entry is not None:
+            elapsed = round(time.time() - entry.get('start_time', time.time()), 1)
+            return jsonify({
+                'status': 'processing',
+                'stage': entry.get('stage') or 'starting',
+                'elapsed': elapsed,
+                'job_id': entry.get('job_id'),
+            })
+
+    slam_status = session.get('slam_status')
+    elapsed = session.get('duration')
+
+    if slam_status == 'done':
+        # Prefer the on-disk result.json (re-process refreshes it).
+        envelope = None
+        proc_path = os.path.join(_processed_dir_for_session(session['name']),
+                                 'result.json')
+        if os.path.isfile(proc_path):
+            try:
+                with open(proc_path, 'r') as f:
+                    envelope = json.load(f)
+            except (OSError, json.JSONDecodeError):
+                envelope = None
+        if envelope is None:
+            envelope = session.get('slam_result')
         return jsonify({
-            'status': proc['status'],
-            'progress': proc['progress'],
+            'status': 'done',
+            'stage': 'done',
+            'elapsed': elapsed,
+            'result': envelope,
+        })
+
+    if slam_status == 'error':
+        return jsonify({
+            'status': 'error',
+            'stage': 'error',
+            'elapsed': elapsed,
+            'error': session.get('slam_error', 'unknown'),
+        })
+
+    if slam_status == 'cancelled':
+        return jsonify({
+            'status': 'cancelled',
+            'stage': 'cancelled',
             'elapsed': elapsed,
         })
 
-    # Return stored result
-    if session.get('slam_result'):
-        return jsonify({
-            'status': 'done',
-            'result': session['slam_result'],
-        })
-
-    if session.get('slam_error'):
-        return jsonify({
-            'status': 'error',
-            'error': session['slam_error'],
-        })
-
-    return jsonify({'status': 'not_processed'})
+    return jsonify({
+        'status': slam_status or 'not_processed',
+        'stage': session.get('slam_stage') or slam_status,
+        'elapsed': elapsed,
+    })
 
 
-@app.route('/api/session/<session_id>/download')
-def api_download(session_id):
-    """Redirect to the PLY download URL."""
+@app.route('/api/session/<session_id>/best_view/<int:idx>.jpg')
+def api_best_view(session_id, idx):
+    """Serve `processed/<name>/best_views/<idx>.jpg` from local disk."""
     session = _get_session(session_id)
     if not session:
         return jsonify({'error': 'Session not found'}), 404
-
-    result = session.get('slam_result')
-    if not result:
-        return jsonify({'error': 'No SLAM result available'}), 404
-
-    url = result.get('download_url')
-    if not url:
-        return jsonify({'error': 'No download URL'}), 404
-
-    return redirect(url)
+    path = os.path.join(_processed_dir_for_session(session['name']),
+                        'best_views', f'{idx}.jpg')
+    if not os.path.isfile(path):
+        return jsonify({'error': 'Image not found'}), 404
+    return send_file(path, mimetype='image/jpeg')
 
 
-# ---------------------------------------------------------------------------
-# Floor Plan Generation
-# ---------------------------------------------------------------------------
-
-def _ply_path_for_session(session):
-    """Return the local PLY path for a session."""
-    return os.path.join(RECORDINGS_DIR, session['name'], 'result.ply')
-
-
-def _leveled_ply_path_for_session(session):
-    """Return the leveled PLY path for a session."""
-    return os.path.join(RECORDINGS_DIR, session['name'], 'result_leveled.ply')
-
-
-def _floorplan_path_for_session(session):
-    """Return the floor plan PNG path for a session."""
-    return os.path.join(RECORDINGS_DIR, session['name'], 'floorplan.png')
+@app.route('/api/session/<session_id>/layout.txt')
+def api_layout_txt(session_id):
+    """Serve `processed/<name>/layout_merged.txt` from local disk."""
+    session = _get_session(session_id)
+    if not session:
+        return jsonify({'error': 'Session not found'}), 404
+    path = os.path.join(_processed_dir_for_session(session['name']),
+                        'layout_merged.txt')
+    if not os.path.isfile(path):
+        return jsonify({'error': 'Layout not found'}), 404
+    return send_file(path, mimetype='text/plain')
 
 
-def _download_ply(session, session_id):
-    """Download PLY from cloud to local storage. Returns local path."""
-    ply_path = _ply_path_for_session(session)
-    if os.path.isfile(ply_path):
-        return ply_path
+@app.route('/api/session/<session_id>/artifact/<name>')
+def api_artifact_proxy(session_id, name):
+    """Server-side proxy that streams a Modal artifact with the API key.
 
-    result = session.get('slam_result')
-    if not result:
-        raise RuntimeError('No SLAM result available')
+    Browser links target this Flask route rather than Modal directly,
+    because Modal would 401 on bare-browser GETs (no X-API-Key header).
+    Only whitelisted artifact names are accepted.
+    """
+    if name not in _ARTIFACT_WHITELIST:
+        return jsonify({'error': 'Unknown artifact'}), 404
 
-    url = result.get('download_url')
-    if not url:
-        raise RuntimeError('No download URL in SLAM result')
+    session = _get_session(session_id)
+    if not session:
+        return jsonify({'error': 'Session not found'}), 404
+    job_id = session.get('job_id')
+    if not job_id:
+        return jsonify({'error': 'No job_id for this session'}), 404
+    if not MODAL_API_KEY:
+        return jsonify({'error': 'MODAL_API not configured on server'}), 503
 
-    os.makedirs(os.path.dirname(ply_path), exist_ok=True)
-
-    _active_processing[session_id]['progress'] = 'Downloading PLY...'
-
-    curl_result = subprocess.run(
-        ['curl', '-s', '-L', '-o', ply_path, url],
-        capture_output=True, text=True, timeout=300,
+    url = f'{MODAL_API_URL}/jobs/{job_id}/artifact/{name}'
+    proc = subprocess.Popen(
+        ['curl', '-sSf', '-L', '--max-time', '600',
+         '-H', f'X-API-Key: {MODAL_API_KEY}', url],
+        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
     )
-    if curl_result.returncode != 0:
-        raise RuntimeError(f'PLY download failed: {curl_result.stderr[:200]}')
 
-    if not os.path.isfile(ply_path) or os.path.getsize(ply_path) == 0:
-        raise RuntimeError('PLY download produced empty file')
-
-    size_mb = os.path.getsize(ply_path) / (1024 * 1024)
-    print(f'Downloaded PLY: {size_mb:.1f} MB -> {ply_path}')
-    return ply_path
-
-
-def _floorplan_thread(session_id):
-    """Background thread: download PLY, level, generate floor plan."""
-    try:
-        from floorplan import level_ply, generate_floorplan
-
-        session = _get_session(session_id)
-        if not session:
-            return
-
-        # Ensure _active_processing entry exists (may already be set by
-        # auto-trigger in _process_thread; needed for manual trigger)
-        if session_id not in _active_processing:
-            _active_processing[session_id] = {
-                'status': 'floorplan',
-                'start_time': time.time(),
-                'progress': 'Starting floor plan generation...',
-            }
-
-        session['floorplan_status'] = 'downloading'
-        session.pop('floorplan_error', None)
-        session.pop('floorplan_meta', None)
-        _put_session(session_id, session)
-
-        # Step 1: Download PLY
-        _active_processing[session_id]['progress'] = 'Downloading PLY...'
-        ply_path = _download_ply(session, session_id)
-
-        # Step 2: Level
-        session = _get_session(session_id)
-        session['floorplan_status'] = 'leveling'
-        _put_session(session_id, session)
-        _active_processing[session_id]['progress'] = 'Leveling point cloud...'
-
-        leveled_path = _leveled_ply_path_for_session(session)
-        level_ply(ply_path, output_path=leveled_path)
-
-        # Step 3: Generate floor plan
-        session = _get_session(session_id)
-        session['floorplan_status'] = 'generating'
-        _put_session(session_id, session)
-        _active_processing[session_id]['progress'] = 'Detecting walls...'
-
-        floorplan_path = _floorplan_path_for_session(session)
-        png_path, metadata = generate_floorplan(
-            leveled_path, output_path=floorplan_path,
-            ortho_tol=15.0, debug=False)
-
-        # Done
-        session = _get_session(session_id)
-        session['floorplan_status'] = 'done'
-        session['floorplan_meta'] = metadata
-        _put_session(session_id, session)
-
-        print(f'Floor plan generated: {metadata["num_walls"]} walls, '
-              f'{metadata["area_m2"]}m2 -> {png_path}')
-
-    except Exception as e:
-        import traceback
-        traceback.print_exc()
-        session = _get_session(session_id)
-        if session:
-            session['floorplan_status'] = 'error'
-            session['floorplan_error'] = str(e)
-            _put_session(session_id, session)
-    finally:
-        _active_processing.pop(session_id, None)
-
-
-@app.route('/api/session/<session_id>/floorplan', methods=['POST'])
-def api_floorplan(session_id):
-    """Generate floor plan from session's PLY. Runs in background thread."""
-    session = _get_session(session_id)
-    if not session:
-        return jsonify({'error': 'Session not found'}), 404
-
-    with _processing_lock:
-        if session_id in _active_processing:
-            return jsonify({'error': 'Already processing'}), 409
-        if not session.get('slam_result'):
-            return jsonify({'error': 'No SLAM result — process the scan first'}), 400
-        _active_processing[session_id] = {
-            'status': 'floorplan', 'start_time': time.time(),
-            'progress': 'Starting...',
-        }
-
-    thread = threading.Thread(
-        target=_floorplan_thread,
-        args=(session_id,),
-        daemon=True,
-    )
-    thread.start()
-
-    return jsonify({'session_id': session_id, 'status': 'started'})
-
-
-@app.route('/api/session/<session_id>/floorplan.png')
-def api_floorplan_image(session_id):
-    """Serve the generated floor plan PNG."""
-    session = _get_session(session_id)
-    if not session:
-        return jsonify({'error': 'Session not found'}), 404
-
-    png_path = _floorplan_path_for_session(session)
-    if not os.path.isfile(png_path):
-        return jsonify({'error': 'Floor plan not generated yet'}), 404
-
-    return send_file(png_path, mimetype='image/png')
-
-
-# ---------------------------------------------------------------------------
-# Wall Detection + Selection
-# ---------------------------------------------------------------------------
-
-def _walls_preview_path_for_session(session):
-    return os.path.join(RECORDINGS_DIR, session['name'], 'walls_preview.png')
-
-
-def _candidates_dir_for_session(session):
-    return os.path.join(RECORDINGS_DIR, session['name'], 'candidates')
-
-
-def _detect_walls_thread(session_id, ortho_tol=15.0):
-    """Background thread: level PLY, generate candidate floor plans."""
-    try:
-        from floorplan import level_ply, generate_candidates
-
-        session = _get_session(session_id)
-        if not session:
-            return
-
-        if session_id not in _active_processing:
-            _active_processing[session_id] = {
-                'status': 'floorplan',
-                'start_time': time.time(),
-                'progress': 'Detecting walls...',
-            }
-
-        # Download PLY if needed
-        _active_processing[session_id]['progress'] = 'Downloading PLY...'
-        ply_path = _download_ply(session, session_id)
-
-        # Level if needed
-        leveled_path = _leveled_ply_path_for_session(session)
-        if not os.path.isfile(leveled_path):
-            _active_processing[session_id]['progress'] = 'Leveling point cloud...'
-            level_ply(ply_path, output_path=leveled_path)
-
-        # Generate candidate floor plans
-        _active_processing[session_id]['progress'] = 'Generating floor plan candidates...'
-        cand_dir = _candidates_dir_for_session(session)
-        candidates = generate_candidates(leveled_path, output_dir=cand_dir,
-                                          ortho_tol=ortho_tol)
-
-        # Strip png_path (not needed in JSON) — compute from id instead
-        for c in candidates:
-            c.pop('png_path', None)
-            c.pop('wall_line_indices', None)
-
-        # Store candidates in session
-        session = _get_session(session_id)
-        session['floorplan_candidates'] = candidates
-        session['floorplan_status'] = 'candidates_ready'
-        session.pop('floorplan_error', None)
-        session.pop('floorplan_meta', None)
-        _put_session(session_id, session)
-
-        print(f'Generated {len(candidates)} floor plan candidates '
-              f'for session {session_id}')
-
-    except Exception as e:
-        import traceback
-        traceback.print_exc()
-        session = _get_session(session_id)
-        if session:
-            session['floorplan_status'] = 'error'
-            session['floorplan_error'] = str(e)
-            _put_session(session_id, session)
-    finally:
-        _active_processing.pop(session_id, None)
-
-
-def _generate_from_selection_thread(session_id, selected_ids):
-    """Background thread: generate floor plan from selected walls."""
-    try:
-        from floorplan import generate_floorplan_from_selection
-
-        session = _get_session(session_id)
-        if not session:
-            return
-
-        if session_id not in _active_processing:
-            _active_processing[session_id] = {
-                'status': 'floorplan',
-                'start_time': time.time(),
-                'progress': 'Generating floor plan...',
-            }
-
-        leveled_path = _leveled_ply_path_for_session(session)
-        floorplan_path = _floorplan_path_for_session(session)
-
-        session['floorplan_status'] = 'generating'
-        _put_session(session_id, session)
-
-        # Pass walls_data so wall IDs map correctly to line indices
-        walls_data = session.get('detected_walls', [])
-        png_path, metadata = generate_floorplan_from_selection(
-            leveled_path, selected_ids, output_path=floorplan_path,
-            ortho_tol=15.0, walls_data=walls_data)
-
-        session = _get_session(session_id)
-        session['floorplan_status'] = 'done'
-        session['floorplan_meta'] = metadata
-        session.pop('floorplan_error', None)
-        _put_session(session_id, session)
-
-        print(f'Floor plan generated: {metadata["num_walls"]} walls, '
-              f'{metadata["area_m2"]}m2')
-
-    except Exception as e:
-        import traceback
-        traceback.print_exc()
-        session = _get_session(session_id)
-        if session:
-            session['floorplan_status'] = 'error'
-            session['floorplan_error'] = str(e)
-            _put_session(session_id, session)
-    finally:
-        _active_processing.pop(session_id, None)
-
-
-@app.route('/api/session/<session_id>/floorplan/detect', methods=['POST'])
-def api_detect_walls(session_id):
-    """Generate candidate floor plans. Returns after processing."""
-    session = _get_session(session_id)
-    if not session:
-        return jsonify({'error': 'Session not found'}), 404
-
-    with _processing_lock:
-        if session_id in _active_processing:
-            return jsonify({'error': 'Already processing'}), 409
-        if not session.get('slam_result'):
-            return jsonify({'error': 'No SLAM result'}), 400
-        _active_processing[session_id] = {
-            'status': 'floorplan', 'start_time': time.time(),
-            'progress': 'Starting wall detection...',
-        }
-
-    data = request.get_json(force=True, silent=True) or {}
-    ortho_tol = data.get('ortho_tol', 15.0)
-
-    thread = threading.Thread(
-        target=_detect_walls_thread,
-        args=(session_id, ortho_tol),
-        daemon=True,
-    )
-    thread.start()
-
-    return jsonify({'session_id': session_id, 'status': 'detecting'})
-
-
-@app.route('/api/session/<session_id>/floorplan/candidate/<int:cand_id>.png')
-def api_candidate_image(session_id, cand_id):
-    """Serve a candidate floor plan PNG."""
-    session = _get_session(session_id)
-    if not session:
-        return jsonify({'error': 'Session not found'}), 404
-
-    cand_dir = _candidates_dir_for_session(session)
-    png_path = os.path.join(cand_dir, f'candidate_{cand_id}.png')
-    if not os.path.isfile(png_path):
-        return jsonify({'error': 'Candidate not found'}), 404
-
-    return send_file(png_path, mimetype='image/png')
-
-
-@app.route('/api/session/<session_id>/floorplan/pick', methods=['POST'])
-def api_pick_candidate(session_id):
-    """Pick a candidate floor plan as the final result."""
-    session = _get_session(session_id)
-    if not session:
-        return jsonify({'error': 'Session not found'}), 404
-
-    if session_id in _active_processing:
-        return jsonify({'error': 'Still processing'}), 409
-
-    data = request.get_json(force=True, silent=True) or {}
-    cand_id = data.get('candidate_id')
-    if cand_id is None:
-        return jsonify({'error': 'candidate_id required'}), 400
-
-    candidates = session.get('floorplan_candidates', [])
-    chosen = None
-    for c in candidates:
-        if c['id'] == cand_id:
-            chosen = c
-            break
-    if not chosen:
-        return jsonify({'error': f'Candidate {cand_id} not found'}), 404
-
-    # Copy candidate PNG to the final floorplan path
-    cand_dir = _candidates_dir_for_session(session)
-    src = os.path.join(cand_dir, f'candidate_{cand_id}.png')
-    dst = _floorplan_path_for_session(session)
-    if os.path.isfile(src):
-        import shutil
-        shutil.copy2(src, dst)
-
-    session['floorplan_status'] = 'done'
-    session['floorplan_meta'] = {
-        'num_walls': chosen['num_walls'],
-        'wall_lengths': chosen['wall_lengths'],
-        'area_m2': chosen['area_m2'],
-        'dimensions': chosen['dimensions'],
-    }
-    _put_session(session_id, session)
-
-    return jsonify({'status': 'done', 'meta': session['floorplan_meta']})
+    mime = 'application/octet-stream'
+    if name.endswith('.json'):
+        mime = 'application/json'
+    elif name.endswith('.txt'):
+        mime = 'text/plain'
+    elif name.endswith('.ply'):
+        mime = 'application/octet-stream'
+
+    @stream_with_context
+    def gen():
+        try:
+            while True:
+                chunk = proc.stdout.read(64 * 1024)
+                if not chunk:
+                    break
+                yield chunk
+        finally:
+            try:
+                proc.stdout.close()
+            except Exception:
+                pass
+            try:
+                proc.wait(timeout=2)
+            except Exception:
+                proc.kill()
+
+    return Response(gen(), mimetype=mime,
+                    headers={'Content-Disposition':
+                             f'inline; filename="{name}"'})
 
 
 # ---------------------------------------------------------------------------
@@ -1919,29 +2045,43 @@ def _cleanup_on_exit():
 
 
 def _recover_stuck_sessions():
-    """Reset sessions stuck in intermediate states from unclean shutdown."""
-    stuck_statuses = {'processing', 'launching_driver', 'waiting_for_topics',
-                      'starting', 'recording'}
-    stuck_fp = {'downloading', 'leveling', 'generating'}
+    """Reset sessions stuck in intermediate states from an unclean shutdown.
+
+    Recording-state recovery (existing): `status` field.
+    SLAM recovery (new, Modal): `slam_status` field — anything in the
+    pre-`done` lifecycle is considered stuck. Each recovered session with a
+    persisted `job_id` triggers a best-effort `DELETE /jobs/{job_id}` so a
+    long-running H100 container is freed instead of burning credits.
+    """
+    stuck_recording = {'processing', 'launching_driver', 'waiting_for_topics',
+                       'starting', 'recording'}
+    stuck_slam_exact = {'compressing', 'uploading', 'queued', 'decoding', 'cancelled'}
     sessions = _get_sessions()
     for sid, s in sessions.items():
         changed = False
-        original_status = s.get('status')
-        if original_status in stuck_statuses:
+
+        if s.get('status') in stuck_recording:
             s['status'] = 'stopped'
-            if original_status == 'processing':
-                s['slam_status'] = 'error'
-                s['slam_error'] = 'Interrupted by shutdown'
             changed = True
-        if s.get('slam_status') in ('uploading', 'compressing'):
+
+        slam_status = s.get('slam_status')
+        is_stuck_slam = (
+            slam_status in stuck_slam_exact
+            or (isinstance(slam_status, str) and slam_status.startswith('stage_'))
+        )
+        if is_stuck_slam:
+            # Best-effort tell Modal to drop the container.
+            job_id = s.get('job_id')
+            if job_id and MODAL_API_KEY:
+                try:
+                    _modal_cancel(job_id)
+                except Exception as e:
+                    _log(f'recovery: _modal_cancel({job_id}) failed: {e}')
             s['slam_status'] = 'error'
+            s['slam_stage'] = 'error'
             s['slam_error'] = 'Interrupted by shutdown'
-            s['status'] = 'stopped'
             changed = True
-        if s.get('floorplan_status') in stuck_fp:
-            s['floorplan_status'] = 'error'
-            s['floorplan_error'] = 'Interrupted by shutdown'
-            changed = True
+
         if changed:
             _put_session(sid, s)
             print(f'Recovered stuck session: {s["name"]}')
@@ -1949,6 +2089,7 @@ def _recover_stuck_sessions():
 
 if __name__ == '__main__':
     os.makedirs(RECORDINGS_DIR, exist_ok=True)
+    os.makedirs(PROCESSED_DIR, exist_ok=True)
     os.makedirs(CALIBRATION_DIR, exist_ok=True)
     _recover_stuck_sessions()
     atexit.register(_cleanup_on_exit)

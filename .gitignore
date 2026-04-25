@@ -6,3 +6,4 @@ image.png
 .claude/
 calibration/
 *.mp4
+.env

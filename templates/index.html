@@ -28,36 +28,42 @@
         .btn:active { opacity: 0.7; }
         .btn-record { background: #e94560; color: #fff; }
         .btn-stop { background: #f0a500; color: #1a1a2e; }
-        .btn-delete { background: none; color: #e94560; border: 1px solid #e94560; font-size: 0.85em; padding: 8px 14px; width: auto; margin: 0; min-height: 40px; }
-        .btn-process { background: #4ecca3; color: #1a1a2e; font-size: 0.85em; padding: 8px 14px; width: auto; margin: 0; border: none; border-radius: 6px; font-weight: 600; cursor: pointer; min-height: 40px; }
+        .btn-delete { background: none; color: #e94560; border: 1px solid #e94560; font-size: 0.85em; padding: 8px 14px; width: auto; margin: 0; min-height: 44px; }
+        .btn-process { background: #4ecca3; color: #1a1a2e; font-size: 0.85em; padding: 8px 14px; width: auto; margin: 0; border: none; border-radius: 6px; font-weight: 600; cursor: pointer; min-height: 44px; }
         .btn-process:disabled { opacity: 0.4; }
-        .btn-download { background: #0f3460; color: #eee; font-size: 0.85em; padding: 8px 14px; width: auto; margin: 0; border: none; border-radius: 6px; font-weight: 600; cursor: pointer; text-decoration: none; display: inline-block; min-height: 40px; }
 
-        .slam-result { font-size: 0.8em; color: #4ecca3; margin-top: 4px; padding: 6px; background: #1a1a2e; border-radius: 4px; display: flex; flex-wrap: wrap; gap: 6px; }
-        .slam-result span { margin-right: 0; }
         .slam-progress { font-size: 0.85em; color: #f0a500; margin-top: 4px; }
         .slam-error { font-size: 0.85em; color: #e94560; margin-top: 4px; }
 
-        .floorplan-container { margin-top: 8px; padding: 8px; background: #1a1a2e; border-radius: 6px; }
-        .floorplan-container img { width: 100%; border-radius: 4px; margin-top: 4px; }
-        .floorplan-meta { font-size: 0.8em; color: #4ecca3; display: flex; flex-wrap: wrap; gap: 8px; }
-        .floorplan-status { font-size: 0.85em; color: #f0a500; margin-top: 4px; }
-        .btn-floorplan { background: #0f3460; color: #eee; font-size: 0.9em; padding: 12px 14px; width: auto; margin: 0; border: none; border-radius: 8px; font-weight: 600; cursor: pointer; min-height: 44px; }
-        .btn-floorplan:active { opacity: 0.7; }
-        .btn-floorplan.primary { background: #4ecca3; color: #1a1a2e; }
+        .badge { display: inline-block; font-size: 0.75em; padding: 3px 8px; border-radius: 4px; font-weight: 600; margin-left: 6px; vertical-align: middle; }
+        .badge-cancelled { background: rgba(240, 165, 0, 0.18); color: #f0a500; border: 1px solid #f0a500; }
 
-        .candidates-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 8px; margin-top: 8px; }
-        .candidate-card { background: #16213e; border-radius: 6px; padding: 6px; cursor: pointer; border: 3px solid transparent; transition: border-color 0.15s; min-height: 44px; }
-        .candidate-card:active { border-color: #4ecca3; background: #1a2a4e; }
-        .candidate-card img { width: 100%; border-radius: 4px; }
-        .candidate-dims { font-size: 1.1em; color: #4ecca3; font-weight: 700; text-align: center; margin-top: 4px; }
-        .candidate-detail { font-size: 0.85em; color: #888; text-align: center; margin-top: 2px; }
-        .candidates-title { font-size: 0.85em; color: #f0a500; margin-bottom: 6px; font-weight: 600; }
+        .result-block { margin-top: 8px; padding: 8px; background: #1a1a2e; border-radius: 6px; }
+        .metrics-row { display: flex; flex-wrap: wrap; gap: 6px 12px; font-size: 0.8em; color: #4ecca3; margin-bottom: 8px; }
+        .metrics-row span { white-space: nowrap; }
 
-        .ortho-toggle { display: flex; align-items: center; gap: 8px; margin-top: 8px; font-size: 0.85em; color: #888; min-height: 40px; }
-        .ortho-toggle input { accent-color: #4ecca3; width: 20px; height: 20px; }
+        .floorplan-svg { width: 100%; height: auto; background: #0f1525; border-radius: 4px; display: block; }
+        .floorplan-svg .wall { stroke: #4ecca3; stroke-linecap: square; }
+        .floorplan-svg .door-arc { fill: none; stroke: #f0a500; stroke-width: 0.03; }
+        .floorplan-svg .door-stop { stroke: #f0a500; stroke-width: 0.05; stroke-linecap: square; }
+        .floorplan-svg .window { stroke: #0f3460; stroke-linecap: square; }
+        .floorplan-svg .furn { stroke: #e94560; fill: rgba(233,69,96,0.15); cursor: pointer; }
+        .floorplan-svg .furn-label { font-size: 0.18px; fill: #eee; pointer-events: none; }
 
-        .voxel-select { background: #1a1a2e; color: #eee; border: 1px solid #0f3460; border-radius: 4px; padding: 6px 8px; font-size: 0.85em; margin-right: 6px; min-height: 36px; }
+        .gallery-title { font-size: 0.85em; color: #888; margin: 10px 0 4px; font-weight: 600; }
+        .gallery-empty { font-size: 0.85em; color: #666; text-align: center; padding: 12px; }
+        .gallery-class-group { margin-bottom: 10px; }
+        .gallery-class-header { font-size: 0.8em; color: #f0a500; margin-bottom: 4px; font-weight: 600; }
+        .gallery-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 6px; }
+        .gallery-card { background: #16213e; border-radius: 4px; overflow: hidden; padding: 4px; transition: outline 0.15s; outline: 2px solid transparent; }
+        .gallery-card.flash { outline-color: #e94560; }
+        .gallery-card img { width: 100%; border-radius: 3px; display: block; background: #0f1525; min-height: 60px; }
+        .gallery-card .label { font-size: 0.75em; color: #4ecca3; margin-top: 2px; }
+        .gallery-card .dist { font-size: 0.7em; color: #888; }
+
+        .artifact-row { margin-top: 10px; display: flex; flex-wrap: wrap; gap: 6px; }
+        .artifact-link { background: #0f3460; color: #eee; font-size: 0.78em; padding: 6px 10px; border-radius: 4px; text-decoration: none; min-height: 44px; display: inline-flex; align-items: center; }
+        .artifact-link:active { opacity: 0.7; }
 
         .recording-indicator { display: flex; align-items: center; gap: 8px; padding: 10px; background: #e94560; border-radius: 6px; margin-bottom: 8px; font-weight: 600; }
         .recording-dot { width: 12px; height: 12px; background: #fff; border-radius: 50%; animation: blink 1s infinite; }
@@ -170,6 +176,10 @@
         let isRecording = false;
         let processingStates = {};
         let previewErrors = 0;
+        // Cache the result envelope per session, so we don't refetch on every loadSessions().
+        const resultCache = {};
+        // Track which sessions have a result-fetch in flight, to avoid duplicate hits.
+        const resultInFlight = {};
 
         // --- SSE ---
         function connectSSE() {
@@ -191,27 +201,30 @@
             const nowProcessing = Object.keys(processing);
             let needRefresh = false;
 
-            // Refresh if something finished or changed status type
+            // Refresh if something finished or stage changed.
             for (const sid of wasProcessing) {
                 if (!nowProcessing.includes(sid)) {
                     needRefresh = true;
-                } else if (processingStates[sid].status !== processing[sid].status) {
-                    needRefresh = true;
+                } else {
+                    const before = processingStates[sid];
+                    const now = processing[sid];
+                    if (before.status !== now.status || before.stage !== now.stage) {
+                        needRefresh = true;
+                    }
                 }
             }
 
             processingStates = processing;
             if (needRefresh) loadSessions();
 
-            // Update progress displays
+            // Update inline progress lines.
             for (const [sid, info] of Object.entries(processing)) {
-                const prefix = info.status === 'floorplan' ? 'fp-progress' : 'slam-progress';
-                const el = document.getElementById(`${prefix}-${sid}`);
+                const el = document.getElementById(`slam-progress-${sid}`);
                 if (el) {
                     const mins = Math.floor(info.elapsed / 60);
                     const secs = Math.floor(info.elapsed % 60);
-                    const label = info.status === 'floorplan' ? 'Floor plan: ' : '';
-                    el.textContent = `${label}${info.progress} (${mins}:${secs.toString().padStart(2, '0')})`;
+                    const stage = info.stage || info.progress || info.status || 'working';
+                    el.textContent = `Processing — ${stage} (${mins}:${secs.toString().padStart(2, '0')})`;
                 }
             }
         }
@@ -297,7 +310,6 @@
                     previewImg.src = '/api/camera/preview';
                 }
 
-                // Show/hide calibration card based on camera
                 document.getElementById('calib-card').style.display = d.camera.ok ? 'block' : 'none';
             } catch (e) {
                 document.getElementById('s-network').textContent = 'Fetch error';
@@ -344,18 +356,17 @@
         }
 
         async function processSession(id) {
-            const voxelSelect = document.getElementById(`voxel-${id}`);
-            const voxelSize = voxelSelect ? voxelSelect.value : null;
             const btn = document.getElementById(`btn-process-${id}`);
             if (btn) btn.disabled = true;
 
+            // Wipe any cached result so we refetch after the new run finishes.
+            delete resultCache[id];
+
             try {
-                const body = {};
-                if (voxelSize) body.voxel_size = parseFloat(voxelSize);
                 const res = await fetch(`/api/session/${id}/process`, {
                     method: 'POST',
                     headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify(body),
+                    body: JSON.stringify({}),
                 });
                 const d = await res.json();
                 if (!res.ok) {
@@ -369,47 +380,326 @@
             }
         }
 
-        async function detectWalls(id) {
-            const orthoEl = document.getElementById(`ortho-${id}`);
-            const orthoTol = (orthoEl && orthoEl.checked) ? 15 : 0;
-            try {
-                const res = await fetch(`/api/session/${id}/floorplan/detect`, {
-                    method: 'POST',
-                    headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({ortho_tol: orthoTol}),
-                });
-                const d = await res.json();
-                if (!res.ok) alert(d.error || 'Failed to start');
-                loadSessions();
-            } catch (e) {
-                alert('Network error: ' + e.message);
-            }
-        }
-
-        async function pickCandidate(sessionId, candidateId) {
-            try {
-                const res = await fetch(`/api/session/${sessionId}/floorplan/pick`, {
-                    method: 'POST',
-                    headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({candidate_id: candidateId}),
-                });
-                const d = await res.json();
-                if (!res.ok) alert(d.error || 'Failed to pick candidate');
-                loadSessions();
-            } catch (e) {
-                alert('Network error: ' + e.message);
-            }
-        }
-
         async function deleteSession(id) {
             if (!confirm('Delete this recording?')) return;
             try {
                 await fetch(`/api/session/${id}`, {method: 'DELETE'});
+                delete resultCache[id];
                 loadSessions();
             } catch (e) {
                 alert('Failed to delete');
             }
         }
+
+        // ---------- Result envelope rendering ----------
+
+        async function fetchResult(sessionId) {
+            if (resultCache[sessionId] || resultInFlight[sessionId]) return;
+            resultInFlight[sessionId] = true;
+            try {
+                const res = await fetch(`/api/session/${sessionId}/result`);
+                if (!res.ok) {
+                    console.warn(`result fetch failed for ${sessionId}: ${res.status}`);
+                    return;
+                }
+                const data = await res.json();
+                if (data && data.result) {
+                    resultCache[sessionId] = data.result;
+                    // Re-render to inject the freshly fetched envelope.
+                    loadSessions();
+                }
+            } catch (e) {
+                console.warn(`result fetch error for ${sessionId}:`, e);
+            } finally {
+                delete resultInFlight[sessionId];
+            }
+        }
+
+        function renderFloorplanSvg(sessionId, envelope) {
+            const fp = envelope.floorplan || {};
+            const walls = fp.walls || [];
+            const doors = fp.doors || [];
+            const windows = fp.windows || [];
+            const furniture = envelope.furniture || [];
+
+            if (!walls.length) {
+                const empty = document.createElement('div');
+                empty.className = 'gallery-empty';
+                empty.textContent = 'No walls in result';
+                return empty;
+            }
+
+            // Compute extents over walls.
+            let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+            for (const w of walls) {
+                for (const p of [w.start, w.end]) {
+                    if (p[0] < minX) minX = p[0];
+                    if (p[0] > maxX) maxX = p[0];
+                    if (p[1] < minY) minY = p[1];
+                    if (p[1] > maxY) maxY = p[1];
+                }
+            }
+            const pad = 0.5;
+            minX -= pad; minY -= pad; maxX += pad; maxY += pad;
+            const w = maxX - minX;
+            const h = maxY - minY;
+
+            const svgNs = 'http://www.w3.org/2000/svg';
+            const svg = document.createElementNS(svgNs, 'svg');
+            svg.setAttribute('class', 'floorplan-svg');
+            // Account for the y-flip: viewBox spans the same world rect, but we
+            // flip inside a wrapping <g> so +Y points up on screen.
+            svg.setAttribute('viewBox', `${minX} ${-maxY} ${w} ${h}`);
+            svg.setAttribute('preserveAspectRatio', 'xMidYMid meet');
+
+            const flipG = document.createElementNS(svgNs, 'g');
+            flipG.setAttribute('transform', 'scale(1,-1)');
+            svg.appendChild(flipG);
+
+            // Build a wall lookup so doors/windows can find their parent.
+            const wallById = {};
+            for (const wl of walls) wallById[wl.id] = wl;
+
+            // Helper: parent wall direction (unit vector) and length.
+            function wallDir(wl) {
+                const dx = wl.end[0] - wl.start[0];
+                const dy = wl.end[1] - wl.start[1];
+                const len = Math.hypot(dx, dy) || 1;
+                return { dx: dx/len, dy: dy/len, len };
+            }
+
+            // Walls as plain line segments. We draw doors as gaps by overlaying
+            // a black "cut" segment on top of the wall — simpler and reliable.
+            for (const wl of walls) {
+                const line = document.createElementNS(svgNs, 'line');
+                line.setAttribute('x1', wl.start[0]);
+                line.setAttribute('y1', wl.start[1]);
+                line.setAttribute('x2', wl.end[0]);
+                line.setAttribute('y2', wl.end[1]);
+                line.setAttribute('class', 'wall');
+                line.setAttribute('stroke-width', '0.05');
+                flipG.appendChild(line);
+            }
+
+            // Doors: cut a gap on the parent wall, plus an arc indicator.
+            for (const dr of doors) {
+                const wl = wallById[dr.wall];
+                if (!wl) continue;
+                const { dx, dy } = wallDir(wl);
+                const halfW = (dr.width || 0.8) / 2;
+                const cx = dr.center[0], cy = dr.center[1];
+                // Erase the gap on the wall by drawing a thicker segment in bg color.
+                const gap = document.createElementNS(svgNs, 'line');
+                gap.setAttribute('x1', cx - dx * halfW);
+                gap.setAttribute('y1', cy - dy * halfW);
+                gap.setAttribute('x2', cx + dx * halfW);
+                gap.setAttribute('y2', cy + dy * halfW);
+                gap.setAttribute('stroke', '#0f1525');
+                gap.setAttribute('stroke-width', '0.07');
+                flipG.appendChild(gap);
+
+                // Stop marker on one side of the opening.
+                const stop = document.createElementNS(svgNs, 'line');
+                stop.setAttribute('x1', cx - dx * halfW);
+                stop.setAttribute('y1', cy - dy * halfW);
+                stop.setAttribute('x2', cx - dx * halfW + (-dy) * 0.05);
+                stop.setAttribute('y2', cy - dy * halfW + (dx) * 0.05);
+                stop.setAttribute('class', 'door-stop');
+                flipG.appendChild(stop);
+
+                // Arc indicating swing. Start at one jamb, sweep to the perpendicular.
+                const sx = cx - dx * halfW;
+                const sy = cy - dy * halfW;
+                const r = dr.width || 0.8;
+                // End point: r along the perpendicular direction (-dy, dx) from sx,sy.
+                const ex = sx + (-dy) * r;
+                const ey = sy + (dx) * r;
+                const arc = document.createElementNS(svgNs, 'path');
+                arc.setAttribute('d', `M ${sx} ${sy} A ${r} ${r} 0 0 1 ${ex} ${ey}`);
+                arc.setAttribute('class', 'door-arc');
+                flipG.appendChild(arc);
+            }
+
+            // Windows: thicker double line on parent wall.
+            for (const wn of windows) {
+                const wl = wallById[wn.wall];
+                if (!wl) continue;
+                const { dx, dy } = wallDir(wl);
+                const halfW = (wn.width || 1.0) / 2;
+                const cx = wn.center[0], cy = wn.center[1];
+                // Inner light line
+                const inner = document.createElementNS(svgNs, 'line');
+                inner.setAttribute('x1', cx - dx * halfW);
+                inner.setAttribute('y1', cy - dy * halfW);
+                inner.setAttribute('x2', cx + dx * halfW);
+                inner.setAttribute('y2', cy + dy * halfW);
+                inner.setAttribute('class', 'window');
+                inner.setAttribute('stroke-width', '0.12');
+                flipG.appendChild(inner);
+                const inner2 = document.createElementNS(svgNs, 'line');
+                inner2.setAttribute('x1', cx - dx * halfW);
+                inner2.setAttribute('y1', cy - dy * halfW);
+                inner2.setAttribute('x2', cx + dx * halfW);
+                inner2.setAttribute('y2', cy + dy * halfW);
+                inner2.setAttribute('stroke', '#4ecca3');
+                inner2.setAttribute('stroke-width', '0.04');
+                flipG.appendChild(inner2);
+            }
+
+            // Furniture: rotated rects per item.
+            for (const f of furniture) {
+                const cx = f.center[0], cy = f.center[1];
+                const w0 = (f.size && f.size[0]) || 0.3;
+                const d0 = (f.size && f.size[1]) || 0.3;
+                const yawRad = f.yaw || 0;
+                const yawDeg = yawRad * 180 / Math.PI;
+                const rect = document.createElementNS(svgNs, 'rect');
+                rect.setAttribute('x', -w0 / 2);
+                rect.setAttribute('y', -d0 / 2);
+                rect.setAttribute('width', w0);
+                rect.setAttribute('height', d0);
+                rect.setAttribute('class', 'furn');
+                rect.setAttribute('stroke-width', '0.03');
+                rect.setAttribute('transform', `translate(${cx} ${cy}) rotate(${yawDeg})`);
+                rect.addEventListener('click', () => {
+                    const targetId = `bbox-${f.id}-${sessionId}`;
+                    const el = document.getElementById(targetId);
+                    if (el) {
+                        el.scrollIntoView({behavior: 'smooth', block: 'center'});
+                        el.classList.add('flash');
+                        setTimeout(() => el.classList.remove('flash'), 1200);
+                    }
+                });
+                flipG.appendChild(rect);
+            }
+
+            return svg;
+        }
+
+        function renderGallery(sessionId, envelope) {
+            const wrap = document.createElement('div');
+            const items = envelope.best_images || [];
+
+            const title = document.createElement('div');
+            title.className = 'gallery-title';
+            title.textContent = `Furniture (${items.length})`;
+            wrap.appendChild(title);
+
+            if (items.length === 0) {
+                const empty = document.createElement('div');
+                empty.className = 'gallery-empty';
+                empty.textContent = 'No objects detected';
+                wrap.appendChild(empty);
+                return wrap;
+            }
+
+            // Group by class while remembering original index (used for img URL).
+            const groups = {};
+            items.forEach((it, idx) => {
+                const cls = it.class || 'unknown';
+                (groups[cls] = groups[cls] || []).push({ it, idx });
+            });
+
+            for (const cls of Object.keys(groups).sort()) {
+                const group = document.createElement('div');
+                group.className = 'gallery-class-group';
+
+                const header = document.createElement('div');
+                header.className = 'gallery-class-header';
+                header.textContent = `${cls} (${groups[cls].length})`;
+                group.appendChild(header);
+
+                const grid = document.createElement('div');
+                grid.className = 'gallery-grid';
+
+                for (const { it, idx } of groups[cls]) {
+                    const card = document.createElement('div');
+                    card.className = 'gallery-card';
+                    card.id = `bbox-${it.bbox_id}-${sessionId}`;
+
+                    const img = document.createElement('img');
+                    img.src = `/api/session/${sessionId}/best_view/${idx}.jpg`;
+                    img.alt = `${cls} ${idx}`;
+                    img.loading = 'lazy';
+                    img.onerror = () => { img.style.display = 'none'; };
+                    card.appendChild(img);
+
+                    const label = document.createElement('div');
+                    label.className = 'label';
+                    label.textContent = cls;
+                    card.appendChild(label);
+
+                    const dist = document.createElement('div');
+                    dist.className = 'dist';
+                    const dm = (it.camera_distance_m != null) ? it.camera_distance_m.toFixed(2) : '?';
+                    dist.textContent = `${dm} m`;
+                    card.appendChild(dist);
+
+                    grid.appendChild(card);
+                }
+
+                group.appendChild(grid);
+                wrap.appendChild(group);
+            }
+
+            return wrap;
+        }
+
+        function renderResultBlock(sessionId, envelope) {
+            const block = document.createElement('div');
+            block.className = 'result-block';
+
+            // Headline metrics row.
+            const slamMx = (envelope.metrics && envelope.metrics.slam) || {};
+            const totalDur = envelope.metrics && envelope.metrics.total_duration_s;
+            const bbox = slamMx.bounding_box_m || [];
+            const bboxStr = (bbox.length === 3)
+                ? `${bbox[0].toFixed(1)} x ${bbox[1].toFixed(1)} x ${bbox[2].toFixed(1)} m`
+                : '';
+            const traj = (typeof slamMx.trajectory_length_m === 'number')
+                ? slamMx.trajectory_length_m.toFixed(1) : '?';
+            const frames = (slamMx.num_frames != null) ? slamMx.num_frames : '?';
+
+            const metricsRow = document.createElement('div');
+            metricsRow.className = 'metrics-row';
+            metricsRow.innerHTML = ''
+                + `<span>${frames} frames</span>`
+                + (bboxStr ? `<span>${bboxStr}</span>` : '')
+                + `<span>${traj} m walked</span>`
+                + (totalDur != null ? `<span>${totalDur} s total</span>` : '');
+            block.appendChild(metricsRow);
+
+            // Floor plan SVG.
+            const svg = renderFloorplanSvg(sessionId, envelope);
+            block.appendChild(svg);
+
+            // Furniture gallery.
+            const gallery = renderGallery(sessionId, envelope);
+            block.appendChild(gallery);
+
+            // Artifact links.
+            const artRow = document.createElement('div');
+            artRow.className = 'artifact-row';
+            const artifacts = [
+                ['colored_map.ply', 'Open colored map (PLY)'],
+                ['scene_with_boxes.ply', 'Open scene+boxes (PLY)'],
+                ['result.json', 'Open result.json'],
+            ];
+            for (const [name, label] of artifacts) {
+                const a = document.createElement('a');
+                a.className = 'artifact-link';
+                a.href = `/api/session/${sessionId}/artifact/${name}`;
+                a.textContent = label;
+                a.target = '_blank';
+                a.rel = 'noopener';
+                artRow.appendChild(a);
+            }
+            block.appendChild(artRow);
+
+            return block;
+        }
+
+        // ---------- Sessions list ----------
 
         async function loadSessions() {
             try {
@@ -434,40 +724,34 @@
                     nameSpan.className = 'session-name-text';
                     nameSpan.textContent = s.name;
 
+                    // Cancelled badge inline with the name.
+                    if (s.slam_status === 'cancelled') {
+                        const badge = document.createElement('span');
+                        badge.className = 'badge badge-cancelled';
+                        badge.textContent = 'Cancelled';
+                        nameSpan.appendChild(badge);
+                    }
+
                     const btnGroup = document.createElement('div');
                     btnGroup.style.display = 'flex';
                     btnGroup.style.gap = '6px';
                     btnGroup.style.alignItems = 'center';
 
-                    // Process button (show if stopped/no slam result and not currently processing)
                     const procInfo = processingStates[s.id];
-                    const isSlamProcessing = (procInfo && procInfo.status !== 'floorplan') || s.slam_status === 'compressing' || s.slam_status === 'uploading';
-                    const canProcess = (s.status === 'stopped' || s.status === 'processed') && !isSlamProcessing && s.bag_size;
+                    const isProcessing = !!procInfo;
+                    const terminal = ['done', 'error', 'cancelled'];
+                    const canStart = (s.status === 'stopped' || s.status === 'processed') && !isProcessing && s.bag_size;
+                    const canReprocess = canStart && terminal.includes(s.slam_status);
+                    const canFirstProcess = canStart && !s.slam_status;
 
-                    if (canProcess && !s.slam_result) {
-                        const voxelSelect = document.createElement('select');
-                        voxelSelect.className = 'voxel-select';
-                        voxelSelect.id = `voxel-${s.id}`;
-                        voxelSelect.innerHTML = '<option value="0.005">5mm</option><option value="0.01">10mm</option><option value="0.02" selected>20mm</option>';
-                        btnGroup.appendChild(voxelSelect);
-
+                    if (canFirstProcess) {
                         const procBtn = document.createElement('button');
                         procBtn.className = 'btn-process';
                         procBtn.id = `btn-process-${s.id}`;
                         procBtn.textContent = 'Process';
                         procBtn.onclick = () => processSession(s.id);
                         btnGroup.appendChild(procBtn);
-                    }
-
-                    // Download button if we have results
-                    if (s.slam_result && s.slam_result.download_url) {
-                        const dlBtn = document.createElement('a');
-                        dlBtn.className = 'btn-download';
-                        dlBtn.href = `/api/session/${s.id}/download`;
-                        dlBtn.textContent = 'Download PLY';
-                        btnGroup.appendChild(dlBtn);
-
-                        // Re-process button
+                    } else if (canReprocess) {
                         const reBtn = document.createElement('button');
                         reBtn.className = 'btn-process';
                         reBtn.id = `btn-process-${s.id}`;
@@ -490,7 +774,17 @@
                     const created = s.created ? new Date(s.created).toLocaleString() : '';
                     const dur = s.duration ? s.duration + 's' : '';
                     const size = s.bag_size || 'no data';
-                    meta.innerHTML = `${created} | ${dur} | ${size} | <span class="${s.status === 'error' ? 'err' : 'ok'}">${s.status}</span>`;
+                    const summary = s.result_summary;
+                    let summaryHtml = '';
+                    if (summary) {
+                        summaryHtml = ` | <span class="ok">`
+                            + `${summary.num_walls || 0} walls, `
+                            + `${summary.num_doors || 0} doors, `
+                            + `${summary.num_windows || 0} windows, `
+                            + `${summary.num_furniture || 0} objects`
+                            + `</span>`;
+                    }
+                    meta.innerHTML = `${created} | ${dur} | ${size} | <span class="${s.status === 'error' ? 'err' : 'ok'}">${s.status}</span>${summaryHtml}`;
 
                     const scp = document.createElement('div');
                     scp.className = 'session-scp';
@@ -500,158 +794,39 @@
                     item.appendChild(meta);
                     item.appendChild(scp);
 
-                    // SLAM processing progress
-                    if (isSlamProcessing) {
+                    // Single stage-based progress line while a job is active.
+                    if (isProcessing) {
                         const prog = document.createElement('div');
                         prog.className = 'slam-progress';
                         prog.id = `slam-progress-${s.id}`;
-                        prog.textContent = procInfo ? `${procInfo.progress} (${Math.floor(procInfo.elapsed/60)}:${Math.floor(procInfo.elapsed%60).toString().padStart(2,'0')})` : 'Processing...';
+                        const mins = Math.floor((procInfo.elapsed || 0) / 60);
+                        const secs = Math.floor((procInfo.elapsed || 0) % 60);
+                        const stage = procInfo.stage || procInfo.progress || procInfo.status || 'working';
+                        prog.textContent = `Processing — ${stage} (${mins}:${secs.toString().padStart(2, '0')})`;
                         item.appendChild(prog);
                     }
 
-                    // SLAM results
-                    if (s.slam_result) {
-                        const res = document.createElement('div');
-                        res.className = 'slam-result';
-                        res.innerHTML = `<span>${Number(s.slam_result.num_points).toLocaleString()} points</span>`
-                            + `<span>${s.slam_result.bounding_box}</span>`
-                            + `<span>SLAM: ${s.slam_result.slam_time}s</span>`
-                            + `<span>Total: ${s.slam_result.total_time}s</span>`;
-                        item.appendChild(res);
-                    }
-
-                    // SLAM error
-                    if (s.slam_error && !s.slam_result) {
+                    // Error line when SLAM failed.
+                    if (s.slam_status === 'error' && s.slam_error) {
                         const errDiv = document.createElement('div');
                         errDiv.className = 'slam-error';
                         errDiv.textContent = `Processing error: ${s.slam_error}`;
                         item.appendChild(errDiv);
                     }
 
-                    // Floor plan section
-                    const fpStatus = s.floorplan_status;
-                    const fpProcessing = procInfo && procInfo.status === 'floorplan';
-
-                    if (fpProcessing || (fpStatus && fpStatus !== 'done' && fpStatus !== 'error' && fpStatus !== 'candidates_ready')) {
-                        // Floor plan in progress
-                        const fpProg = document.createElement('div');
-                        fpProg.className = 'floorplan-status';
-                        fpProg.id = `fp-progress-${s.id}`;
-                        if (procInfo && procInfo.status === 'floorplan') {
-                            const mins = Math.floor(procInfo.elapsed / 60);
-                            const secs = Math.floor(procInfo.elapsed % 60);
-                            fpProg.textContent = `Floor plan: ${procInfo.progress} (${mins}:${secs.toString().padStart(2,'0')})`;
+                    // Done: render full result envelope (lazy-fetch with cache).
+                    if (s.slam_status === 'done') {
+                        const envelope = resultCache[s.id];
+                        if (envelope) {
+                            item.appendChild(renderResultBlock(s.id, envelope));
                         } else {
-                            fpProg.textContent = `Floor plan: ${fpStatus}...`;
+                            const placeholder = document.createElement('div');
+                            placeholder.className = 'slam-progress';
+                            placeholder.textContent = 'Loading result...';
+                            item.appendChild(placeholder);
+                            // Kick off the fetch (will re-render via loadSessions on success).
+                            fetchResult(s.id);
                         }
-                        item.appendChild(fpProg);
-                    }
-
-                    if (fpStatus === 'done' && s.floorplan_meta) {
-                        const fpDiv = document.createElement('div');
-                        fpDiv.className = 'floorplan-container';
-
-                        const fpMeta = document.createElement('div');
-                        fpMeta.className = 'floorplan-meta';
-                        const m = s.floorplan_meta;
-                        const wallLens = m.wall_lengths ? m.wall_lengths.map(w => w.toFixed(2) + 'm').join(', ') : '';
-                        fpMeta.innerHTML = `<span>${m.num_walls} walls</span>`
-                            + `<span>Area: ${m.area_m2}m&sup2;</span>`
-                            + `<span>Walls: ${wallLens}</span>`;
-                        fpDiv.appendChild(fpMeta);
-
-                        const fpImg = document.createElement('img');
-                        fpImg.src = `/api/session/${s.id}/floorplan.png?t=${Date.now()}`;
-                        fpImg.alt = 'Floor Plan';
-                        fpImg.onclick = () => window.open(fpImg.src, '_blank');
-                        fpDiv.appendChild(fpImg);
-
-                        // Re-generate button
-                        const regenBtn = document.createElement('button');
-                        regenBtn.className = 'btn-floorplan';
-                        regenBtn.textContent = 'Try Different Options';
-                        regenBtn.style.marginTop = '8px';
-                        regenBtn.onclick = () => detectWalls(s.id);
-                        fpDiv.appendChild(regenBtn);
-
-                        item.appendChild(fpDiv);
-                    }
-
-                    if (fpStatus === 'error' && s.floorplan_error) {
-                        const fpErr = document.createElement('div');
-                        fpErr.className = 'slam-error';
-                        fpErr.textContent = `Floor plan error: ${s.floorplan_error}`;
-                        item.appendChild(fpErr);
-
-                        // Retry button
-                        if (s.slam_result) {
-                            const retryBtn = document.createElement('button');
-                            retryBtn.className = 'btn-floorplan';
-                            retryBtn.textContent = 'Retry Wall Detection';
-                            retryBtn.style.marginTop = '6px';
-                            retryBtn.onclick = () => detectWalls(s.id);
-                            item.appendChild(retryBtn);
-                        }
-                    }
-
-                    // Candidate floor plans grid
-                    if (fpStatus === 'candidates_ready' && s.floorplan_candidates && s.floorplan_candidates.length > 0) {
-                        const title = document.createElement('div');
-                        title.className = 'candidates-title';
-                        title.textContent = `${s.floorplan_candidates.length} floor plan option${s.floorplan_candidates.length > 1 ? 's' : ''} — tap the one that matches your room:`;
-                        item.appendChild(title);
-
-                        const grid = document.createElement('div');
-                        grid.className = 'candidates-grid';
-
-                        s.floorplan_candidates.forEach(c => {
-                            const card = document.createElement('div');
-                            card.className = 'candidate-card';
-                            card.onclick = () => pickCandidate(s.id, c.id);
-
-                            const img = document.createElement('img');
-                            img.src = `/api/session/${s.id}/floorplan/candidate/${c.id}.png?t=${Date.now()}`;
-                            img.alt = `Option ${c.id}`;
-                            card.appendChild(img);
-
-                            const dims = document.createElement('div');
-                            dims.className = 'candidate-dims';
-                            const dimsSorted = c.dimensions.slice().sort((a,b) => a-b);
-                            dims.textContent = dimsSorted.map(d => d.toFixed(2) + 'm').join(' x ');
-                            card.appendChild(dims);
-
-                            const detail = document.createElement('div');
-                            detail.className = 'candidate-detail';
-                            detail.textContent = `${c.num_walls} walls | ${c.area_m2} m\u00B2`;
-                            card.appendChild(detail);
-
-                            grid.appendChild(card);
-                        });
-
-                        item.appendChild(grid);
-                    }
-
-                    // Show "Generate Floor Plan" button if SLAM done but no candidates yet
-                    if (s.slam_result && !fpStatus && !fpProcessing) {
-                        const fpBtn = document.createElement('button');
-                        fpBtn.className = 'btn-floorplan primary';
-                        fpBtn.textContent = 'Generate Floor Plan';
-                        fpBtn.style.marginTop = '8px';
-                        fpBtn.onclick = () => detectWalls(s.id);
-                        item.appendChild(fpBtn);
-
-                        const orthoDiv = document.createElement('div');
-                        orthoDiv.className = 'ortho-toggle';
-                        const orthoCheck = document.createElement('input');
-                        orthoCheck.type = 'checkbox';
-                        orthoCheck.id = `ortho-${s.id}`;
-                        orthoCheck.checked = true;
-                        const orthoLabel = document.createElement('label');
-                        orthoLabel.htmlFor = orthoCheck.id;
-                        orthoLabel.textContent = 'Snap to 90\u00B0 (rectangular rooms)';
-                        orthoDiv.appendChild(orthoCheck);
-                        orthoDiv.appendChild(orthoLabel);
-                        item.appendChild(orthoDiv);
                     }
 
                     container.appendChild(item);
@@ -700,7 +875,7 @@
                         document.getElementById('calib-status').textContent = 'Intrinsics calibrated successfully';
                         document.getElementById('calib-status').style.color = '#4ecca3';
                     } else {
-                        document.getElementById('calib-status').textContent = 'Calibration failed — try again';
+                        document.getElementById('calib-status').textContent = 'Calibration failed - try again';
                         document.getElementById('calib-status').style.color = '#e94560';
                     }
                     checkStatus();
@@ -719,7 +894,6 @@
                 alert('Need 6 numbers: tx ty tz roll pitch yaw');
                 return;
             }
-            // Convert RPY to quaternion on the server side
             try {
                 const res = await fetch('/api/calibration/extrinsics', {
                     method: 'POST',
