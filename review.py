@@ -797,6 +797,20 @@ def carry_over_review(old_review, old_result, new_result,
         old_entry = dict(old_bxs.get(old_id) or {})
         # Drop merge_into (member) pointers — we rebuild them below.
         old_entry.pop('target', None)
+        # Drop image_override (and recapture_at): the recapture JPEG lives
+        # in the OLD run dir under the old positional index and isn't
+        # copied into the new run; the new positional index is also wrong
+        # because Modal regenerates bbox positions. Surface a warning so
+        # the technician knows their recapture work needs redoing.
+        dropped_override = old_entry.pop('image_override', None)
+        old_entry.pop('recapture_at', None)
+        if isinstance(dropped_override, str) and dropped_override:
+            multi_match_warnings.append({
+                'old_bbox_id': old_id,
+                'new_bbox_id': new_id,
+                'reason': 'carried_over_recapture_lost',
+                'old_image_override': dropped_override,
+            })
         old_status = old_entry.get('status', STATUS_UNTOUCHED)
 
         # If the old bbox was a merged_into member, its target may or may
@@ -832,6 +846,26 @@ def carry_over_review(old_review, old_result, new_result,
                 old_entry['merged_from'] = mapped
 
         new_bxs[new_id] = old_entry
+
+    # Second pass: re-stamp merge MEMBERS. The per-bbox loop above
+    # demotes old MERGED_INTO members to KEPT (line ~807) and rebuilds
+    # the primary's `merged_from` with new ids — but never re-points the
+    # member entries back at the new primary. Without this pass, both
+    # the merged primary AND every member render as standalone furniture
+    # in the upload envelope, shipping ghost duplicates.
+    for new_primary_id, primary_entry in new_bxs.items():
+        if not isinstance(primary_entry, dict):
+            continue
+        members = primary_entry.get('merged_from')
+        if not isinstance(members, list):
+            continue
+        for member_id in members:
+            if not isinstance(member_id, str) or member_id not in new_bxs:
+                continue
+            new_bxs[member_id] = {
+                'status': STATUS_MERGED_INTO,
+                'target': new_primary_id,
+            }
 
     # Warnings:
     #  - unmatched_old: every old bbox that didn't match anything in new.

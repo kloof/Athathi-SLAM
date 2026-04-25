@@ -228,37 +228,41 @@ def build_image_files_for_upload(reviewed_envelope, run_dir):
     For each entry:
       - Field name: `image_<bbox_id>` (preserves the linkage from the
         envelope to the image without depending on positional index).
-      - Path: prefer `<run_dir>/best_views/<idx>_recapture.jpg` if present,
-        else `<run_dir>/best_views/<idx>.jpg`. The `<idx>` is the entry's
-        position in the `best_images` list (mirrors how
-        `_scoped_save_done_artifacts` lays them down).
+      - Path: `<run_dir>/<entry.local_path>` — `render_reviewed` already
+        resolves the right path (original `<orig_idx>.jpg`, or the
+        `image_override` recapture path), using the entry's position in
+        the *unfiltered* Modal envelope. We must trust that here:
+        re-deriving from `enumerate()` over the filtered list silently
+        pairs surviving bboxes with their neighbour's photo whenever any
+        bbox has been deleted or merged.
 
-    Skips entries with no on-disk file — logs a stderr warning.
+    Skips entries with no `local_path` or whose file is missing on disk —
+    logs a stderr warning.
 
     Returns: list of `(field_name, absolute_path)` tuples.
     """
     if not isinstance(reviewed_envelope, dict):
         return []
-    bv_dir = os.path.join(run_dir, 'best_views')
     out = []
-    for idx, entry in enumerate(reviewed_envelope.get('best_images') or []):
+    for entry in (reviewed_envelope.get('best_images') or []):
         if not isinstance(entry, dict):
             continue
         bbox_id = entry.get('bbox_id')
         if not isinstance(bbox_id, str) or not bbox_id:
             continue
-        # Recapture beats original, per the upload-filter intent (§21c).
-        recap = os.path.join(bv_dir, f'{idx}_recapture.jpg')
-        original = os.path.join(bv_dir, f'{idx}.jpg')
-        chosen = None
-        if os.path.isfile(recap):
-            chosen = recap
-        elif os.path.isfile(original):
-            chosen = original
-        if chosen is None:
+        local = entry.get('local_path')
+        if not isinstance(local, str) or not local:
+            print(
+                f'[submit] best_images entry for bbox {bbox_id!r} has no '
+                f'local_path; skipping',
+                file=sys.stderr,
+            )
+            continue
+        chosen = os.path.join(run_dir, local)
+        if not os.path.isfile(chosen):
             print(
                 f'[submit] image missing on disk for bbox {bbox_id!r} '
-                f'in {run_dir}; skipping',
+                f'(expected {chosen}); skipping',
                 file=sys.stderr,
             )
             continue
@@ -406,6 +410,7 @@ def stamp_submit_outcome(scan_id, *, runs, response=None, error=None,
             manifest['submitted_at'] = now
         manifest.pop('submit_pending', None)
         manifest.pop('submit_pending_error', None)
+        manifest.pop('submit_pending_uploads', None)
         if response is not None:
             manifest['submit_response'] = response
 
@@ -601,22 +606,37 @@ def submit_pending_retry(token_provider, *,
 
     def _do_upload_for(sid):
         """Re-render + re-upload every reviewed run for `sid`. Returns
-        (ok, error_str_or_None). Network failure → ok=False, no raise."""
+        (ok, error_str_or_None). Network failure → ok=False, no raise.
+
+        Skips scans whose names appear in `manifest.submit_pending_uploads`
+        — those bundles already reached Athathi on a prior attempt; re-
+        uploading them double-bills the back-office (which has no
+        deterministic dedupe key on the v1 envelope).
+        """
         try:
             runs_local = gather_runs_for_submit(sid)
         except Exception as e:
             return False, f'gather failed: {e!s}'
+        m0 = _projects.read_manifest(sid)
+        if isinstance(m0, dict):
+            already = list(m0.get('submit_pending_uploads') or [])
+        else:
+            already = []
+        already_set = set(already)
         for entry in runs_local:
+            scan_name = entry.get('scan_name')
+            if scan_name in already_set:
+                continue
             run_dir = entry.get('run_dir')
             if not run_dir or not os.path.isdir(run_dir):
                 return False, (
-                    f"{entry.get('scan_name')} has no run dir on disk"
+                    f"{scan_name} has no run dir on disk"
                 )
             try:
                 rendered = render_run_outputs(run_dir, technician)
             except FileNotFoundError as e:
                 return False, (
-                    f"{entry.get('scan_name')}: result.json missing ({e})"
+                    f"{scan_name}: result.json missing ({e})"
                 )
             try:
                 outcome = submit_run_outputs(
@@ -632,6 +652,17 @@ def submit_pending_retry(token_provider, *,
             # `outcome.uploaded == False` only when no endpoint configured;
             # that's still "did the local render", so let it through.
             _ = outcome
+            # Persist the progress so a subsequent retry skips this scan
+            # if a later one in the list fails.
+            if isinstance(scan_name, str) and scan_name:
+                already_set.add(scan_name)
+                try:
+                    m_progress = _projects.read_manifest(sid)
+                    if isinstance(m_progress, dict):
+                        m_progress['submit_pending_uploads'] = sorted(already_set)
+                        _projects.write_manifest(sid, m_progress)
+                except OSError:
+                    pass
         return True, None
 
     for manifest in _projects.list_projects():
@@ -648,6 +679,7 @@ def submit_pending_retry(token_provider, *,
                     m.pop('submit_pending', None)
                     m.pop('submit_pending_error', None)
                     m.pop('submit_pending_stage', None)
+                    m.pop('submit_pending_uploads', None)
                     _projects.write_manifest(sid, m)
             except OSError:
                 pass
@@ -675,6 +707,7 @@ def submit_pending_retry(token_provider, *,
                     cur.pop('submit_pending', None)
                     cur.pop('submit_pending_error', None)
                     cur.pop('submit_pending_stage', None)
+                    cur.pop('submit_pending_uploads', None)
                     _projects.write_manifest(sid, cur)
                 except OSError:
                     pass

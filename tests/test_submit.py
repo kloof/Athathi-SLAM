@@ -306,7 +306,7 @@ class TestRenderRunOutputs(_SubmitTestBase):
 # ---------------------------------------------------------------------------
 
 class TestBuildImageFiles(_SubmitTestBase):
-    def test_prefers_recapture_over_original(self):
+    def test_uses_local_path_recapture(self):
         sid = self._seed_project()
         run_dir = self._seed_scan_with_run(sid)
         # Drop a recapture next to the originals.
@@ -315,24 +315,62 @@ class TestBuildImageFiles(_SubmitTestBase):
         with open(recap0, 'wb') as f:
             f.write(b'\xff\xd8recapture')
 
+        # Realistic envelope shape — `render_reviewed` always stamps
+        # `local_path`. When `image_override` was set on the review, the
+        # path points at the recapture file.
         envelope = {
             'best_images': [
-                {'bbox_id': 'bbox_0'},
-                {'bbox_id': 'bbox_1'},
+                {'bbox_id': 'bbox_0',
+                 'local_path': 'best_views/0_recapture.jpg'},
+                {'bbox_id': 'bbox_1', 'local_path': 'best_views/1.jpg'},
             ],
         }
         out = submit.build_image_files_for_upload(envelope, run_dir)
-        # Should include both, but bbox_0 → recapture.
         as_dict = dict(out)
         self.assertEqual(as_dict['image_bbox_0'], recap0)
         self.assertTrue(as_dict['image_bbox_1'].endswith('1.jpg'))
+
+    def test_pairs_by_local_path_after_delete(self):
+        # After a delete, the filtered best_images is missing one entry,
+        # but each surviving entry's `local_path` still references the
+        # original Modal index. Pairing must follow `local_path`, not
+        # the filtered position.
+        sid = self._seed_project()
+        run_dir = self._seed_scan_with_run(sid)
+        bv = os.path.join(run_dir, 'best_views')
+        # `_seed_scan_with_run` lays down `0.jpg` and `1.jpg`. Add a `2.jpg`.
+        with open(os.path.join(bv, '2.jpg'), 'wb') as f:
+            f.write(b'\xff\xd8two')
+
+        envelope = {
+            'best_images': [
+                {'bbox_id': 'bbox_0', 'local_path': 'best_views/0.jpg'},
+                # bbox_1 deleted — gap at position 1
+                {'bbox_id': 'bbox_2', 'local_path': 'best_views/2.jpg'},
+            ],
+        }
+        out = submit.build_image_files_for_upload(envelope, run_dir)
+        as_dict = dict(out)
+        self.assertTrue(as_dict['image_bbox_0'].endswith('0.jpg'))
+        self.assertTrue(as_dict['image_bbox_2'].endswith('2.jpg'))
 
     def test_skips_missing_files_and_warns(self):
         sid = self._seed_project()
         run_dir = self._seed_scan_with_run(sid, with_images=False)
         envelope = {
             'best_images': [
-                {'bbox_id': 'bbox_0'},
+                {'bbox_id': 'bbox_0', 'local_path': 'best_views/0.jpg'},
+            ],
+        }
+        out = submit.build_image_files_for_upload(envelope, run_dir)
+        self.assertEqual(out, [])
+
+    def test_skips_entries_without_local_path(self):
+        sid = self._seed_project()
+        run_dir = self._seed_scan_with_run(sid)
+        envelope = {
+            'best_images': [
+                {'bbox_id': 'bbox_0'},  # no local_path
             ],
         }
         out = submit.build_image_files_for_upload(envelope, run_dir)
@@ -660,6 +698,39 @@ class TestSubmitPendingRetryStageAware(_SubmitTestBase):
         self.assertFalse(m_after.get('submit_pending'))
         self.assertNotIn('submit_pending_stage', m_after)
         self.assertTrue(m_after.get('submitted_at'))
+
+    def test_stage_upload_skips_already_uploaded_scans(self):
+        # Multi-scan project: bedroom already uploaded successfully on the
+        # first attempt; living_room failed mid-loop. The retry sweep must
+        # only re-upload living_room — re-uploading bedroom would produce
+        # duplicates back-office (the v1 envelope has no scan_id/run_id
+        # dedupe key on the wire).
+        sid = self._seed_project()
+        self._seed_scan_with_run(sid, scan_name='bedroom',
+                                 run_id='r_bed')
+        self._seed_scan_with_run(sid, scan_name='living_room',
+                                 run_id='r_liv')
+        m = projects.read_manifest(sid)
+        m['submit_pending'] = True
+        m['submit_pending_stage'] = 'upload'
+        m['submit_pending_uploads'] = ['bedroom']
+        projects.write_manifest(sid, m)
+
+        with mock.patch.object(athathi_proxy, 'upload_bundle',
+                               return_value={'received': 1}) as m_up, \
+             mock.patch.object(athathi_proxy, 'complete_scan',
+                               return_value={'message': 'ok'}):
+            results = submit.submit_pending_retry(
+                lambda: 'tok',
+                upload_endpoint_provider=lambda: 'http://upload.test/x',
+                technician_provider=lambda: 'tech',
+            )
+        # Only ONE upload call (living_room only) — bedroom skipped.
+        self.assertEqual(m_up.call_count, 1)
+        self.assertEqual(results[0]['status'], 'submitted')
+        m_after = projects.read_manifest(sid)
+        # On success, the tracking field is cleared.
+        self.assertNotIn('submit_pending_uploads', m_after)
 
     def test_stage_upload_re_uploads_then_completes(self):
         sid = self._seed_project()

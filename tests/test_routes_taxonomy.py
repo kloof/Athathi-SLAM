@@ -506,10 +506,13 @@ class TestVsCacheFlush(_TaxonomyRouteBase):
         body = r.get_json()
         # The route returns the raw cached blob.
         self.assertEqual(body['results'][0]['id'], 1)
-        # Backwards-compat: passing the full salted key also works.
+        # Passing an already-salted key is no longer honoured: the route
+        # always re-salts server-side from the current login token, so a
+        # caller can never read another technician's cache by supplying
+        # their salt. The salted_key gets re-salted into a non-existent
+        # path → 404.
         r2 = self.client.get(f'/api/visual-search/cache/{salted_key}')
-        self.assertEqual(r2.status_code, 200)
-        self.assertEqual(r2.get_json()['results'][0]['id'], 1)
+        self.assertEqual(r2.status_code, 404)
 
     def test_get_unknown_sha_404(self):
         self._login()

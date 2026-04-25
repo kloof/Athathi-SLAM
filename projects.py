@@ -554,13 +554,25 @@ def list_scans(scan_id):
             if isinstance(ar, str) and ar:
                 active_run_id = ar
 
+        # A scan is reviewed iff its active run has a review.json with
+        # `reviewed_at` stamped. Without this the SPA's Submit button is
+        # permanently disabled.
+        reviewed = False
+        if active_run_id:
+            rv = _read_json_or_none(
+                os.path.join(
+                    processed_dir_for_run(sid, name, active_run_id),
+                    'review.json',
+                )
+            )
+            if isinstance(rv, dict) and rv.get('reviewed_at'):
+                reviewed = True
+
         out.append({
             'name': name,
             'has_rosbag': has_rosbag,
             'active_run_id': active_run_id,
-            # Step 5 will refine: a scan is reviewed iff its active run has
-            # a review.json with `reviewed_at` set.
-            'reviewed': False,
+            'reviewed': reviewed,
         })
     return out
 

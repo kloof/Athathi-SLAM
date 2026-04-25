@@ -756,6 +756,103 @@ class TestCarryOverReview(unittest.TestCase):
         self.assertEqual(len(unmatched), 1)
         self.assertEqual(unmatched[0]['old_bbox_id'], 'bbox_small')
 
+    def test_merge_members_restamped_when_both_endpoints_survive(self):
+        # bbox_p was a merge primary that absorbed bbox_m. Both survive
+        # spatially into the new run. The new run must keep the merge
+        # intact: primary KEPT with merged_from = [<new_member>], and
+        # the member MERGED_INTO with target = <new_primary>. Without
+        # the restamp the member ships as a free-floating duplicate.
+        old_result = {
+            'job_id': 'j_old',
+            'furniture': [
+                {'id': 'bbox_p', 'class': 'sofa',
+                 'center': [4.0, -2.7, 0.83], 'size': [2.0, 1.0, 0.8]},
+                {'id': 'bbox_m', 'class': 'sofa',
+                 'center': [4.05, -2.65, 0.83], 'size': [2.0, 1.0, 0.8]},
+            ],
+        }
+        new_result = {
+            'job_id': 'j_new',
+            'furniture': [
+                {'id': 'bbox_NEW_P', 'class': 'sofa',
+                 'center': [4.01, -2.71, 0.83], 'size': [2.0, 1.0, 0.8]},
+                {'id': 'bbox_NEW_M', 'class': 'sofa',
+                 'center': [4.06, -2.66, 0.83], 'size': [2.0, 1.0, 0.8]},
+            ],
+        }
+        old_rv = review.initial_review(0, 'r', old_result)
+        # Merge bbox_m into bbox_p: primary becomes KEPT with merged_from,
+        # member becomes MERGED_INTO with target.
+        old_rv['bboxes']['bbox_p'] = {
+            'status': review.STATUS_KEPT,
+            'merged_from': ['bbox_m'],
+        }
+        old_rv['bboxes']['bbox_m'] = {
+            'status': review.STATUS_MERGED_INTO,
+            'target': 'bbox_p',
+        }
+
+        new_rv, _warns = review.carry_over_review(
+            old_rv, old_result, new_result)
+
+        # Find which new id received the primary and which the member.
+        # The carry-over picks the nearest match deterministically; we
+        # don't depend on which-is-which, only that exactly ONE new id
+        # is the primary (KEPT + merged_from) and the OTHER is a member
+        # (MERGED_INTO + target → primary).
+        primaries = [
+            (nid, e) for nid, e in new_rv['bboxes'].items()
+            if e.get('status') == review.STATUS_KEPT
+            and isinstance(e.get('merged_from'), list)
+        ]
+        members = [
+            (nid, e) for nid, e in new_rv['bboxes'].items()
+            if e.get('status') == review.STATUS_MERGED_INTO
+        ]
+        self.assertEqual(len(primaries), 1)
+        self.assertEqual(len(members), 1)
+        new_primary_id, primary = primaries[0]
+        new_member_id, member = members[0]
+        self.assertEqual(primary['merged_from'], [new_member_id])
+        self.assertEqual(member['target'], new_primary_id)
+
+    def test_image_override_dropped_with_warning(self):
+        # The recapture JPEG lives in the old run dir at the OLD positional
+        # index; it isn't copied forward and the new index is wrong anyway.
+        # Carry-over must drop image_override + recapture_at and surface a
+        # `carried_over_recapture_lost` warning.
+        old_result = {
+            'job_id': 'j_old',
+            'furniture': [
+                {'id': 'bbox_0', 'class': 'sofa',
+                 'center': [1.0, 1.0, 0.5], 'size': [2.0, 1.0, 0.8]},
+            ],
+        }
+        new_result = {
+            'job_id': 'j_new',
+            'furniture': [
+                {'id': 'bbox_NEW', 'class': 'sofa',
+                 'center': [1.05, 1.0, 0.5], 'size': [2.0, 1.0, 0.8]},
+            ],
+        }
+        old_rv = review.initial_review(0, 'r', old_result)
+        old_rv['bboxes']['bbox_0'] = {
+            'status': review.STATUS_KEPT,
+            'image_override': 'best_views/0_recapture.jpg',
+            'recapture_at': '2026-04-25T12:00:00',
+        }
+
+        new_rv, warns = review.carry_over_review(
+            old_rv, old_result, new_result)
+        carried = new_rv['bboxes']['bbox_NEW']
+        self.assertNotIn('image_override', carried)
+        self.assertNotIn('recapture_at', carried)
+        lost = [w for w in warns
+                if w['reason'] == 'carried_over_recapture_lost']
+        self.assertEqual(len(lost), 1)
+        self.assertEqual(lost[0]['old_bbox_id'], 'bbox_0')
+        self.assertEqual(lost[0]['new_bbox_id'], 'bbox_NEW')
+
 
 # ---------------------------------------------------------------------------
 # write_review / read_review round-trip

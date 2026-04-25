@@ -552,15 +552,19 @@ class TestRecoverStuckSessions(unittest.TestCase):
         self.assertEqual(self._sessions['b']['slam_status'], 'error')
         self.assertEqual(self._sessions['c']['slam_status'], 'done')
 
-    def test_cancelled_state_is_recovered(self):
+    def test_cancelled_state_is_terminal_and_left_alone(self):
+        # `cancelled` is a terminal state (peer of `done` / `error`)
+        # written deliberately after a clean user cancel — boot-time
+        # recovery must NOT convert it to error.
         self._sessions['x'] = {
             'name': 'x', 'status': 'stopped',
             'slam_status': 'cancelled', 'job_id': 'j_x',
         }
         with mock.patch.object(app, 'MODAL_API_KEY', 'k'), \
-             mock.patch.object(app, '_modal_cancel'):
+             mock.patch.object(app, '_modal_cancel') as m_cancel:
             app._recover_stuck_sessions()
-        self.assertEqual(self._sessions['x']['slam_status'], 'error')
+        self.assertEqual(self._sessions['x']['slam_status'], 'cancelled')
+        m_cancel.assert_not_called()
 
 
 # ---------------------------------------------------------------------------

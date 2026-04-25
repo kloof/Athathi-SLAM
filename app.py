@@ -2122,7 +2122,9 @@ def _recover_stuck_sessions():
     """
     stuck_recording = {'processing', 'launching_driver', 'waiting_for_topics',
                        'starting', 'recording'}
-    stuck_slam_exact = {'compressing', 'uploading', 'queued', 'decoding', 'cancelled'}
+    # 'cancelled' is a terminal state (peer of 'done' / 'error') written
+    # deliberately after a clean user cancel — never sweep it on boot.
+    stuck_slam_exact = {'compressing', 'uploading', 'queued', 'decoding'}
     sessions = _get_sessions()
     for sid, s in sessions.items():
         changed = False
@@ -3478,18 +3480,21 @@ def api_scoped_stop_recording(scan_id, scan_name):
     with _record_lock:
         active_sid = _active_recording.get('session_id')
         active_session = _get_session(active_sid) if active_sid else None
-        if (
-            active_session is not None
-            and active_session.get('project_scoped')
-            and (
-                active_session.get('scan_id') != int(scan_id)
-                or active_session.get('scan_name') != scan_name
-            )
+        # 409 unless the active recording is BOTH project-scoped AND for
+        # the exact same scan. A legacy (non-project-scoped) recording is
+        # always a mismatch from a scoped URL — the legacy `/api/record/stop`
+        # is the right tool there.
+        if active_session is not None and not (
+            active_session.get('project_scoped')
+            and active_session.get('scan_id') == int(scan_id)
+            and active_session.get('scan_name') == scan_name
         ):
             return jsonify({
                 'error': 'active recording belongs to a different scan',
                 'active_scan_id': active_session.get('scan_id'),
                 'active_scan_name': active_session.get('scan_name'),
+                'active_project_scoped': bool(
+                    active_session.get('project_scoped')),
             }), 409
 
         payload, code = _scoped_stop_recording()
@@ -3519,43 +3524,52 @@ def api_scoped_process(scan_id, scan_name):
     if not mcap_path:
         return jsonify({'error': 'No MCAP file found for scan'}), 404
 
-    # BE-4: capture the prior active-run info BEFORE we override it so the
-    # processing thread can carry-over the technician's review state from
-    # the old run to the new run on completion.
-    prior_run_id = _projects.read_active_run(scan_id, scan_name)
-    prior_run_dir = (
-        _projects.processed_dir_for_run(scan_id, scan_name, prior_run_id)
-        if prior_run_id else None
-    )
-
-    # Allocate a fresh run id and make it the active run.
-    run_id = _projects.allocate_run_id(scan_id, scan_name)
-    run_dir = _projects.processed_dir_for_run(scan_id, scan_name, run_id)
-    os.makedirs(run_dir, exist_ok=True)
-    _projects.set_active_run(scan_id, scan_name, run_id)
-
-    # Synthesize a session record so the SSE feed and cancel sweep see this
-    # run. It's keyed by a fresh session_id, distinct from the recording id.
-    session_id = datetime.now().strftime('%Y%m%d_%H%M%S_%f') + '_proc'
-    session = {
-        'name': f'{int(scan_id)}__{scan_name}',
-        'created': datetime.now().isoformat(),
-        'status': 'processing',
-        'project_scoped': True,
-        'scan_id': int(scan_id),
-        'scan_name': str(scan_name),
-        'run_id': run_id,
-        'slam_status': 'compressing',
-        'slam_stage': 'compressing',
-    }
-    _put_session(session_id, session)
-
+    # Hold `_processing_lock` across the dedupe check + the run-id +
+    # active-run + session reservation. The previous code keyed dedupe on
+    # a freshly-minted per-request session_id, which is unique by
+    # construction, so the check was structurally a no-op — two concurrent
+    # POSTs would both pass, allocate distinct run dirs, race on
+    # `set_active_run`, and spawn two H100 Modal jobs.
     with _processing_lock:
-        # Keyed on session_id (unique); two /process requests against the
-        # same scan would always create distinct session_ids since the
-        # timestamp suffix is microsecond-granular.
-        if session_id in _active_processing:
-            return jsonify({'error': 'Already processing'}), 409
+        for _sid, _entry in _active_processing.items():
+            if (
+                _entry.get('scan_id') == int(scan_id)
+                and _entry.get('scan_name') == scan_name
+            ):
+                return jsonify({'error': 'Already processing'}), 409
+
+        # BE-4: capture the prior active-run info BEFORE we override it so
+        # the processing thread can carry-over the technician's review
+        # state from the old run to the new run on completion.
+        prior_run_id = _projects.read_active_run(scan_id, scan_name)
+        prior_run_dir = (
+            _projects.processed_dir_for_run(scan_id, scan_name, prior_run_id)
+            if prior_run_id else None
+        )
+
+        # Allocate a fresh run id and make it the active run.
+        run_id = _projects.allocate_run_id(scan_id, scan_name)
+        run_dir = _projects.processed_dir_for_run(scan_id, scan_name, run_id)
+        os.makedirs(run_dir, exist_ok=True)
+        _projects.set_active_run(scan_id, scan_name, run_id)
+
+        # Synthesize a session record so the SSE feed and cancel sweep see
+        # this run. Keyed by a fresh session_id, distinct from the
+        # recording id.
+        session_id = datetime.now().strftime('%Y%m%d_%H%M%S_%f') + '_proc'
+        session = {
+            'name': f'{int(scan_id)}__{scan_name}',
+            'created': datetime.now().isoformat(),
+            'status': 'processing',
+            'project_scoped': True,
+            'scan_id': int(scan_id),
+            'scan_name': str(scan_name),
+            'run_id': run_id,
+            'slam_status': 'compressing',
+            'slam_stage': 'compressing',
+        }
+        _put_session(session_id, session)
+
         _active_processing[session_id] = {
             'status': 'processing',
             'stage': 'compressing',
@@ -4726,9 +4740,15 @@ def _api_submit_project_locked(scan_id, tok):
             )
             # BACKEND-B2: tag the stage so the retry sweep re-uploads
             # before re-completing — Athathi never received the bundle.
+            # Persist the names of scans whose bundles already uploaded
+            # so the retry sweep does NOT re-upload them (which would
+            # double-bill Athathi for everything before the failure).
             try:
                 m_stage = _projects.read_manifest(scan_id) or {}
                 m_stage['submit_pending_stage'] = 'upload'
+                m_stage['submit_pending_uploads'] = [
+                    r['scan_name'] for r in upload_responses
+                ]
                 _projects.write_manifest(scan_id, m_stage)
             except OSError as _e:
                 _log(f'api_submit_project: stage stamp failed: {_e!r}')
@@ -5354,14 +5374,14 @@ def api_vs_cache_get(sha1):
     BACKEND-B1: the on-disk filename is `<sha1>__<tok[:8]>.json` (salted by
     technician token). The URL stays the bare `<sha1>` for client simplicity
     — we resolve the salted key server-side from the current login token.
-    Defensively also accepts an already-salted `<sha1>__<...>` value for
-    callers that derive the key directly from the cache filename.
     """
     if not auth.is_logged_in():
         return jsonify({'error': 'not logged in'}), 401
-    # If the caller passed an already-salted key, honour it verbatim;
-    # otherwise resolve via the current technician's token.
-    key = sha1 if '__' in sha1 else _vs_salted_key(sha1)
+    # Always re-salt server-side from the current technician's token. We
+    # used to honour an already-salted `<sha1>__<...>` URL, but that
+    # silently let one technician read another's cache by supplying their
+    # salt — defeating BACKEND-B1's per-user partitioning.
+    key = _vs_salted_key(sha1)
     ts, blob = _vs_cache_read(key)
     if blob is None:
         return jsonify({'error': 'not cached'}), 404

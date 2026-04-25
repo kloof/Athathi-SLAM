@@ -258,6 +258,43 @@ class TestListScansRoute(_ScopedRouteBase):
 # 7. POST .../start_recording auth gate
 # ---------------------------------------------------------------------------
 
+class TestScopedStopRecordingGuard(_ScopedRouteBase):
+    """Scoped /stop_recording must 409 when the active recording is a
+    LEGACY (non-project-scoped) one — without this, an unrelated scoped
+    URL can force-kill the legacy bag and corrupt the legacy session
+    record (status stuck at 'recording', no duration / bag_size).
+    """
+
+    def test_legacy_recording_returns_409_from_scoped_stop(self):
+        self._login()
+        self._ensure_project()
+        projects.create_scan(42, 'living_room')
+
+        # Simulate a legacy (non-project-scoped) recording in flight.
+        legacy_sid = 'legacy_recording_id'
+        legacy_session = {
+            'name': 'scan_legacy',
+            'status': 'recording',
+            # NOTE: no 'project_scoped' / 'scan_id' / 'scan_name' fields.
+        }
+        with mock.patch.dict(
+            app._active_recording,
+            {'session_id': legacy_sid},
+            clear=False,
+        ), mock.patch.object(
+            app, '_get_session',
+            side_effect=lambda sid: dict(legacy_session) if sid == legacy_sid else None,
+        ):
+            r = self.client.post(
+                '/api/project/42/scan/living_room/stop_recording',
+            )
+
+        self.assertEqual(r.status_code, 409)
+        body = r.get_json()
+        self.assertIn('different scan', body.get('error', ''))
+        self.assertFalse(body.get('active_project_scoped'))
+
+
 class TestStartRecordingAuth(_ScopedRouteBase):
     def test_not_logged_in_returns_401(self):
         self._ensure_project()
@@ -370,6 +407,26 @@ class TestProcessRoute(_ScopedRouteBase):
         call_args = m_worker.call_args
         # _scoped_process_thread(session_id, mcap_path, run_dir)
         self.assertEqual(call_args.args[2], run_dir)
+
+    def test_concurrent_process_for_same_scan_returns_409(self):
+        # Two POSTs for the same scan must NOT both spawn Modal jobs.
+        # Previously the dedupe key was a freshly-minted per-request
+        # session_id, so the in-lock check was structurally a no-op and
+        # both calls passed — double-billing the H100.
+        self._login()
+        self._ensure_project()
+        projects.create_scan(42, 'living_room')
+        self._seed_mcap()
+
+        with mock.patch.object(app, 'MODAL_API_KEY', 'fake'), \
+             mock.patch.object(app, '_ZSTD_BIN', '/usr/bin/zstd'), \
+             mock.patch.object(app, '_scoped_process_thread'):
+            r1 = self.client.post('/api/project/42/scan/living_room/process')
+            r2 = self.client.post('/api/project/42/scan/living_room/process')
+
+        self.assertEqual(r1.status_code, 200)
+        self.assertEqual(r2.status_code, 409)
+        self.assertIn('Already processing', r2.get_json().get('error', ''))
 
     def test_process_unknown_project_returns_404(self):
         self._login()
