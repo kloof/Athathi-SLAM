@@ -4,5 +4,7 @@
   "last_user": "",
   "post_submit_hook": null,
   "image_transport": "multipart",
-  "visual_search_cache_ttl_s": 86400
+  "visual_search_cache_ttl_s": 86400,
+  "visual_search_top_k": 6,
+  "visual_search_prefetch": true
 }

@@ -278,10 +278,17 @@ class TestSubmit400Gating(unittest.TestCase):
 
     def test_400_no_retry_button(self):
         # 400 (gating) means the work isn't ready — we offer Close, no Retry.
-        # We assert the *guard* exists: status !== 400 gates the Retry button.
+        # JS-5 generalised the guard from `status !== 400` to a 4xx-range
+        # check (`isClient4xx`), so the Retry button is suppressed for any
+        # client-error status, including 400.
         self.assertRegex(
             self.body,
-            r'status\s*!==\s*400',
+            r'isClient4xx\s*=\s*status\s*>=\s*400\s*&&\s*status\s*<\s*500',
+        )
+        # And the Retry button is gated on NOT isClient4xx.
+        self.assertRegex(
+            self.body,
+            r'if\s*\(\s*!isClient4xx\s*\)',
         )
 
 

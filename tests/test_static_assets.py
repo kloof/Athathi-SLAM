@@ -14,6 +14,7 @@ Step 8 brief.
 """
 
 import os
+import re
 import sys
 import unittest
 
@@ -118,6 +119,112 @@ class TestAppCssTokens(unittest.TestCase):
             '.spinner',
         ]:
             self.assertIn(selector, css, f'app.css missing primitive: {selector}')
+
+
+class TestOskAndLayoutFixes(unittest.TestCase):
+    """Locks the OSK / layout / contrast fixes from the technician-UI audit.
+
+    Each test is a CSS-substring check — pure file content, no DOM.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.css = _read(os.path.join(STATIC_DIR, 'app.css'))
+
+    def test_css1_dvh_fallbacks_present(self):
+        # CSS-1: 100vh paired with 100dvh on the three full-height blocks.
+        self.assertIn('min-height: 100dvh;', self.css)
+        self.assertIn('min-height: calc(100dvh - var(--topbar-h));', self.css)
+
+    def test_css2_screen_padding_bottom_260(self):
+        # CSS-2: bottom-anchored buttons reachable when OSK opens.
+        self.assertIn('padding: 16px 16px 260px;', self.css)
+
+    def test_css2_review_screen_padding(self):
+        # CSS-2: .review-screen padding-bottom raised to 260px.
+        self.assertRegex(
+            self.css,
+            r'\.review-screen\s*\{[^}]*padding-bottom:\s*260px',
+        )
+
+    def test_css3_modal_top_anchored(self):
+        # CSS-3: modal host uses align-items: flex-start (was center).
+        self.assertRegex(
+            self.css,
+            r'\.modal-host\s*\{[^}]*align-items:\s*flex-start',
+        )
+        self.assertIn('max-height: calc(100dvh - 24px);', self.css)
+
+    def test_css4_textarea_max_heights(self):
+        # CSS-4: review-notes + settings-textarea capped at 160px.
+        self.assertRegex(
+            self.css,
+            r'\.review-notes__input\s*\{[^}]*max-height:\s*160px',
+        )
+        self.assertRegex(
+            self.css,
+            r'\.settings-textarea\s*\{[^}]*max-height:\s*160px',
+        )
+
+    def test_css5_accent_text_token(self):
+        # CSS-5: WCAG-compliant text-only accent token.
+        self.assertIn('--accent-text:', self.css)
+        # And used at least one place as text color.
+        self.assertIn('color: var(--accent-text);', self.css)
+
+    def test_css6_class_chip_ellipsis(self):
+        # CSS-6: review-card class chip clips long labels with ellipsis.
+        self.assertRegex(
+            self.css,
+            r'\.review-card__class\s*\{[^}]*text-overflow:\s*ellipsis',
+        )
+
+    def test_css7_topbar_user_clipped(self):
+        # CSS-7: topbar username max-width: 140px.
+        self.assertRegex(
+            self.css,
+            r'\.topbar__user\s*\{[^}]*max-width:\s*140px',
+        )
+
+    def test_css8_review_header_below_topbar(self):
+        # CSS-8: sticky review header offset by topbar height.
+        self.assertRegex(
+            self.css,
+            r'\.review-header\s*\{[^}]*top:\s*var\(--topbar-h\)',
+        )
+
+    def test_css9_focus_visible_block_present(self):
+        # CSS-9: combined :focus-visible selector covering project-card et al.
+        self.assertIn('.project-card:focus-visible', self.css)
+        self.assertIn('.scan-row:focus-visible', self.css)
+        self.assertIn('.product-card:focus-visible', self.css)
+        self.assertIn('.runs-list__row:focus-visible', self.css)
+        self.assertIn('.review-tab__btn:focus-visible', self.css)
+        self.assertIn('.section__head:focus-visible', self.css)
+
+    def test_css10_merge_modal_radio_44px(self):
+        # CSS-10: merge-modal radio min-height 44 (was 36).
+        self.assertRegex(
+            self.css,
+            r'\.merge-modal__radio\s*\{[^}]*min-height:\s*44px',
+        )
+        # And no leftover 36 in the same rule.
+        m = re.search(
+            r'\.merge-modal__radio\s*\{[^}]*\}', self.css,
+        )
+        assert m is not None
+        self.assertNotIn('36px', m.group(0))
+
+    def test_css11_osk_open_repositions_toast_and_sticky(self):
+        # CSS-11: body.osk-open lifts the toast and hides the sticky bar.
+        self.assertRegex(
+            self.css,
+            r'body\.osk-open\s+\.toast\s*\{[^}]*bottom:\s*260px',
+        )
+        self.assertRegex(
+            self.css,
+            r'body\.osk-open\s+\.review-sticky\s*\{[^}]*display:\s*none',
+        )
 
 
 class TestAppJsShape(unittest.TestCase):

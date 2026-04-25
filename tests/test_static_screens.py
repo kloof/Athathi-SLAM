@@ -727,5 +727,127 @@ class TestScanPrimaryActionDeadDoneCaseRemoved(unittest.TestCase):
         self.assertEqual(proc.stdout.strip(), 'null')
 
 
+class TestOskFocusListener(unittest.TestCase):
+    """JS-1: global focusin/focusout listener that toggles body.osk-open."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.src = _read(APP_JS_PATH)
+
+    def test_focusin_listener_present(self):
+        self.assertRegex(
+            self.src,
+            r"document\.addEventListener\(\s*'focusin'",
+        )
+
+    def test_focusout_listener_present(self):
+        self.assertRegex(
+            self.src,
+            r"document\.addEventListener\(\s*'focusout'",
+        )
+
+    def test_osk_class_added(self):
+        self.assertIn("classList.add('osk-open')", self.src)
+
+    def test_osk_class_removed(self):
+        self.assertIn("classList.remove('osk-open')", self.src)
+
+    def test_scrollintoview_called(self):
+        self.assertIn('scrollIntoView', self.src)
+
+
+class TestVerifyRecordingAttempts(unittest.TestCase):
+    """JS-3: attempts++ guards against indefinite polling on a network drop."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.src = _read(APP_JS_PATH)
+
+    def test_max_attempts_enforced_at_top_of_interval(self):
+        m = re.search(
+            r'function _verifyRecordingStarted\(\)\s*\{(.*?)\n\s{8}\}',
+            self.src, re.DOTALL,
+        )
+        assert m, '_verifyRecordingStarted not found'
+        body = m.group(1)
+        # The attempts increment + maxAttempts check must precede the
+        # fetch-then chain; otherwise a network-failure path never
+        # triggers the timeout branch.
+        attempts_pos = body.find('attempts++;')
+        check_pos = body.find('attempts >= maxAttempts')
+        fetch_pos = body.find("fetchJson('GET', '/api/status')")
+        self.assertGreater(attempts_pos, -1)
+        self.assertGreater(check_pos, -1)
+        self.assertGreater(fetch_pos, -1)
+        self.assertLess(attempts_pos, fetch_pos)
+        self.assertLess(check_pos, fetch_pos)
+
+
+class TestVerifyProcessStarted(unittest.TestCase):
+    """JS-4: _verifyProcessStarted polls the result endpoint after startProcess."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.src = _read(APP_JS_PATH)
+
+    def test_function_defined(self):
+        self.assertIn('function _verifyProcessStarted(', self.src)
+
+    def test_called_from_start_process(self):
+        # startProcess() -> _verifyProcessStarted(scanId, scanName).
+        self.assertRegex(
+            self.src,
+            r"_verifyProcessStarted\(scanId,\s*scanName\)",
+        )
+
+    def test_polls_result_endpoint(self):
+        self.assertIn("'/result'", self.src)
+
+    def test_handles_error_status(self):
+        # Surfaces error via toast.
+        self.assertRegex(
+            self.src,
+            r"r\.status\s*===\s*'error'",
+        )
+
+
+class TestSubmitRetryPartialFailures(unittest.TestCase):
+    """JS-6: _runSubmitRetrySweep surfaces aggregate failures."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.src = _read(APP_JS_PATH)
+
+    def test_failed_collected(self):
+        # Tracks per-project failures so the post-loop toast can fire.
+        self.assertIn('failed.push(sid)', self.src)
+
+    def test_aggregate_toast_after_loop(self):
+        self.assertRegex(
+            self.src,
+            r"failed\.length\s*\+\s*' '\s*\+\s*nWord\s*\+\s*' failed to sync",
+        )
+
+    def test_401_redirects_to_login(self):
+        self.assertIn("any401 = true", self.src)
+        self.assertIn("location.hash = '#/login'", self.src)
+
+
+class TestSubmitPhaseTimerTracked(unittest.TestCase):
+    """JS-7: phase timer lives on state.pollTimers.submitPhase."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.src = _read(APP_JS_PATH)
+
+    def test_timer_set_on_state(self):
+        self.assertIn('state.pollTimers.submitPhase = timer', self.src)
+
+    def test_timer_cleared_via_state(self):
+        self.assertIn('state.pollTimers.submitPhase', self.src)
+        # Old per-bodyHost reference is gone.
+        self.assertNotIn('bodyHost._phaseTimer', self.src)
+
+
 if __name__ == '__main__':
     unittest.main()

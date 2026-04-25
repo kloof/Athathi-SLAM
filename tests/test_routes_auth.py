@@ -195,6 +195,17 @@ class TestLogoutRoute(_RouteTestBase):
         # Local clear still happened.
         self.assertIsNone(auth.read_token())
 
+    def test_logout_skips_upstream_when_no_token(self):
+        # BE-6: with no token on disk, the upstream call is skipped — saves
+        # a useless network round-trip and prevents transient auth log noise.
+        self.assertIsNone(auth.read_token())
+        with mock.patch.object(athathi_proxy, 'logout') as m_logout:
+            r = self.client.post('/api/auth/logout')
+        self.assertEqual(r.status_code, 200)
+        body = r.get_json()
+        self.assertTrue(body.get('ok'))
+        m_logout.assert_not_called()
+
 
 # ---------------------------------------------------------------------------
 # 4–5. GET /api/auth/me

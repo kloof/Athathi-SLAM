@@ -533,19 +533,78 @@ def merge_bboxes(result, primary_id, member_ids, chosen_class=None,
     # merged into THIS primary are skipped — the primary's existing
     # `merged_from` already contains them.
     effective_members = [m for m in member_ids if m not in idempotent_skips]
-    delta = {
-        primary_id: {
-            'status': STATUS_KEPT,
-            'merged_from': list(effective_members),
-            'class_override': cls,
-        },
+
+    # Auto-pick the best image among (primary + effective members) by
+    # `camera_distance_m` — closer = sharper, less perspective distortion.
+    # Only sets `image_override` if a member's photo wins; if the primary
+    # was already closest, no override is added (its existing JPEG wins).
+    # Skipped entirely when the primary already has an `image_override`
+    # the technician set manually (recapture / explicit override).
+    primary_existing = (existing_bxs.get(primary_id) or {}) if existing_bxs else {}
+    candidate_ids = [primary_id] + effective_members
+    best_id, best_idx, best_dist = _pick_best_image(result, candidate_ids)
+
+    primary_delta = {
+        'status': STATUS_KEPT,
+        'merged_from': list(effective_members),
+        'class_override': cls,
     }
+    # Auto-pick is sticky ONLY when the technician explicitly recaptured.
+    # A prior auto-pick override (`best_views/<idx>.jpg`) gets recomputed on
+    # every merge so adding a new closer member updates the picture.
+    prior_override = primary_existing.get('image_override')
+    has_recapture = (isinstance(prior_override, str)
+                     and prior_override.endswith('_recapture.jpg'))
+    if (best_id is not None
+            and best_id != primary_id
+            and best_idx is not None
+            and not has_recapture):
+        primary_delta['image_override'] = f'best_views/{best_idx}.jpg'
+
+    delta = {primary_id: primary_delta}
     for mid in effective_members:
         delta[mid] = {
             'status': STATUS_MERGED_INTO,
             'target': primary_id,
         }
     return delta
+
+
+def _pick_best_image(result, bbox_ids):
+    """Return (bbox_id, best_image_idx, distance_m) for the bbox with the
+    smallest `camera_distance_m` in `result.best_images[]`. Ties broken
+    alphabetically on bbox_id for determinism.
+
+    Returns (None, None, None) if none of the candidates have a best_image
+    entry with a parseable distance.
+    """
+    if not isinstance(result, dict):
+        return None, None, None
+    images = result.get('best_images') or []
+    by_bbox = {}
+    for i, im in enumerate(images):
+        if not isinstance(im, dict):
+            continue
+        bid = im.get('bbox_id')
+        if not isinstance(bid, str):
+            continue
+        dist = im.get('camera_distance_m')
+        try:
+            dist = float(dist)
+        except (TypeError, ValueError):
+            continue
+        by_bbox[bid] = (i, dist)
+
+    best_id, best_idx, best_dist = None, None, None
+    for bid in bbox_ids:
+        if bid not in by_bbox:
+            continue
+        idx, dist = by_bbox[bid]
+        if (best_dist is None
+                or dist < best_dist
+                or (dist == best_dist and bid < best_id)):
+            best_id, best_idx, best_dist = bid, idx, dist
+    return best_id, best_idx, best_dist
 
 
 def _merge_geometry(result, primary_id, member_ids):
@@ -934,18 +993,26 @@ def render_reviewed(result, review):
         idx_pos = (out.get('best_images') or []).index(img)
         local_default = os.path.join('best_views', f'{idx_pos}.jpg')
 
+        # `image_override` can come from two sources:
+        #   1. Brio recapture (`<idx>_recapture.jpg`) — a fresh photo;
+        #      `pixel_aabb` is no longer meaningful, count toward
+        #      `recaptured_count` for telemetry.
+        #   2. Auto-best-image-on-merge (`<idx>.jpg`) — a SIBLING bbox's
+        #      original Modal frame, swapped in because it's sharper.
+        #      Still a model photo; `pixel_aabb` stays valid; does NOT
+        #      count as a recapture.
         over = entry.get('image_override')
         if isinstance(over, str) and over.strip():
             ni['local_path'] = over
-            ni['image_source'] = 'recapture'
+            if _is_image_recaptured(entry):
+                ni['image_source'] = 'recapture'
+                ni.pop('pixel_aabb', None)
+                recaptured_count += 1
+            else:
+                ni['image_source'] = 'model'
         else:
             ni['local_path'] = local_default
             ni['image_source'] = 'model'
-
-        # Drop pixel_aabb on recapture (no longer meaningful).
-        if ni.get('image_source') == 'recapture':
-            ni.pop('pixel_aabb', None)
-            recaptured_count += 1
 
         new_best.append(ni)
 

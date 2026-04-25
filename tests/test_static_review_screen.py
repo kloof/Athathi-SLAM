@@ -643,10 +643,12 @@ class TestTouchTargets(unittest.TestCase):
         self.assertIn('min-height: 56px', rule,
                       'sticky multi-select buttons must be ≥56 px tall')
 
-    def test_product_card_56(self):
+    def test_product_card_grid_tile_size(self):
+        # Step 7 grid layout: each card is a 3-col tile, taller than the
+        # legacy 56 px single-row card to fit a thumb + 2 lines of text.
         rule = self._rule('.product-card')
-        self.assertIn('min-height: 56px', rule,
-                      'find-product candidate rows must be ≥56 px tall')
+        self.assertIn('min-height: 130px', rule,
+                      'find-product grid tiles must be ≥130 px tall')
 
     def test_runs_list_row_56(self):
         rule = self._rule('.runs-list__row')

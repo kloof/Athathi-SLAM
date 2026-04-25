@@ -847,5 +847,107 @@ class TestReviewRecaptureRecordingRace(_ReviewRouteBase):
         self.assertEqual(ffmpeg_called['n'], 0)
 
 
+class TestReviewWriteLockExposed(_ReviewRouteBase):
+    """BE-3: per-(scan_id, scan_name) review-write lock helper exists."""
+
+    def test_lock_helper_exists(self):
+        self.assertTrue(hasattr(app, '_review_lock_for'))
+        self.assertTrue(callable(app._review_lock_for))
+
+    def test_lock_is_per_key(self):
+        a = app._review_lock_for(42, 'living_room')
+        b = app._review_lock_for(42, 'living_room')
+        c = app._review_lock_for(42, 'kitchen')
+        d = app._review_lock_for(43, 'living_room')
+        self.assertIs(a, b)            # same key -> same lock
+        self.assertIsNot(a, c)         # different scan name
+        self.assertIsNot(a, d)         # different scan id
+
+    def test_concurrent_patches_dont_clobber(self):
+        # Two PATCH requests against the same scan should both land —
+        # the second's mutation must not erase the first's. Without the
+        # lock, a read-modify-write race could lose one.
+        self._login()
+        self._seed_run()
+
+        def patch_one(field_value):
+            local = app.app.test_client()
+            return local.patch(
+                '/api/project/42/scan/living_room/review',
+                json={'bbox_id': 'bbox_0', 'class_override': field_value},
+            )
+
+        results = [None, None]
+        errors = [None, None]
+
+        def worker(i, val):
+            try:
+                results[i] = patch_one(val)
+            except Exception as e:  # pragma: no cover
+                errors[i] = e
+
+        t1 = threading.Thread(target=worker, args=(0, 'armchair'))
+        t2 = threading.Thread(target=worker, args=(1, 'recliner'))
+        t1.start(); t2.start()
+        t1.join(timeout=5); t2.join(timeout=5)
+
+        self.assertIsNone(errors[0])
+        self.assertIsNone(errors[1])
+        self.assertEqual(results[0].status_code, 200)
+        self.assertEqual(results[1].status_code, 200)
+
+        # The final review.json reflects ONE of the two values cleanly —
+        # not a mix; not a missing key.
+        rv = review.read_review(
+            projects.processed_dir_for_run(42, 'living_room', '20260425_142103')
+        )
+        self.assertIn('bbox_0', rv['bboxes'])
+        self.assertIn(rv['bboxes']['bbox_0'].get('class_override'),
+                      ('armchair', 'recliner'))
+
+
+class TestCarryOverHelperWiring(_ReviewRouteBase):
+    """BE-4: `_scoped_apply_carry_over` migrates the prior review onto a new run."""
+
+    def test_helper_exposed(self):
+        self.assertTrue(hasattr(app, '_scoped_apply_carry_over'))
+        self.assertTrue(callable(app._scoped_apply_carry_over))
+
+    def test_apply_carry_over_migrates_class_override(self):
+        # Set up an old run with a class_override and a new run with
+        # geometrically-overlapping furniture. After the helper runs, the
+        # new run's review.json should carry the override.
+        self._login()
+        # Old run.
+        old_dir = self._seed_run(run_id='20260420_120000')
+        # Patch the old review with a class override.
+        with open(os.path.join(old_dir, 'result.json'), 'r') as _f:
+            old_result = json.load(_f)
+        old_rv = review.read_review(old_dir) \
+            or review.initial_review(42, 'living_room', old_result)
+        old_rv = review.set_class_override(old_rv, 'bbox_0', 'armchair')
+        review.write_review(old_dir, old_rv)
+
+        # New run with the same furniture geometry.
+        new_dir = self._seed_run(run_id='20260425_180000')
+
+        app._scoped_apply_carry_over(42, 'living_room', new_dir, old_dir)
+
+        new_rv = review.read_review(new_dir)
+        self.assertIsNotNone(new_rv)
+        self.assertEqual(
+            new_rv['bboxes']['bbox_0'].get('class_override'), 'armchair',
+        )
+
+    def test_apply_carry_over_no_op_without_prior_review(self):
+        # No old review.json on disk -> helper is a clean no-op.
+        self._login()
+        new_dir = self._seed_run()
+        # Sanity: no review on disk before.
+        self.assertIsNone(review.read_review(new_dir))
+        app._scoped_apply_carry_over(42, 'living_room', new_dir, '/no/such/dir')
+        self.assertIsNone(review.read_review(new_dir))
+
+
 if __name__ == '__main__':
     unittest.main()

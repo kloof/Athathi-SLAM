@@ -605,5 +605,44 @@ class TestFindProductCachePerToken(_TaxonomyRouteBase):
                          'B must NOT see A\'s prior cached entry')
 
 
+class TestFindProductSkipsEmptyResultsCache(_TaxonomyRouteBase):
+    """BE-5: empty / failed visual-search responses MUST NOT be cached.
+
+    Otherwise a transient "no matches" reply locks the technician out of
+    real matches until the TTL expires.
+    """
+
+    def test_empty_results_not_cached(self):
+        self._login()
+        self._seed_run_with_image()
+        empty_body = {'results': [], 'total_time': 0.5}
+        with mock.patch.object(athathi_proxy, 'visual_search_full',
+                               return_value=empty_body):
+            r = self.client.post(
+                '/api/project/42/scan/living_room/review/find_product/0',
+            )
+        self.assertEqual(r.status_code, 200)
+        cache_dir = os.path.join(self.tmp_auth, 'cache', 'visual_search')
+        if os.path.isdir(cache_dir):
+            cached = [f for f in os.listdir(cache_dir) if f.endswith('.json')]
+            self.assertEqual(cached, [],
+                             'empty visual-search response was cached')
+
+    def test_upstream_error_dict_not_cached(self):
+        # If the upstream returned a dict with `error`, treat as failed.
+        self._login()
+        self._seed_run_with_image()
+        err_body = {'results': [], 'error': 'rate limited'}
+        with mock.patch.object(athathi_proxy, 'visual_search_full',
+                               return_value=err_body):
+            self.client.post(
+                '/api/project/42/scan/living_room/review/find_product/0',
+            )
+        cache_dir = os.path.join(self.tmp_auth, 'cache', 'visual_search')
+        if os.path.isdir(cache_dir):
+            cached = [f for f in os.listdir(cache_dir) if f.endswith('.json')]
+            self.assertEqual(cached, [])
+
+
 if __name__ == '__main__':
     unittest.main()

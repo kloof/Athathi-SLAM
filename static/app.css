@@ -21,6 +21,7 @@
   --bg-surface:    #F8FAFC;
   --bg-sidebar:    #0F172A;
   --accent:        #22C7A9;
+  --accent-text:   #0F8A73;
   --accent-soft:   #CCF2EA;
   --text-primary:  #0F172A;
   --text-body:     #475569;
@@ -59,10 +60,11 @@ body {
    screens. We give it the same defensive overflow rules. */
 #app-root {
   min-height: 100vh;
+  min-height: 100dvh;
   background: var(--bg-app);
 }
 
-a { color: var(--accent); }
+a { color: var(--accent-text); }
 
 /* Tabular numerals for timers / counters / metrics. */
 .tabular {
@@ -112,6 +114,11 @@ a { color: var(--accent); }
   font-size: 0.85rem;
   color: var(--text-on-dark);
   margin-right: 4px;
+  max-width: 140px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  flex: 0 1 auto;
 }
 .topbar__btn {
   background: transparent;
@@ -135,7 +142,8 @@ a { color: var(--accent); }
 /* Full-viewport content area below the top bar. */
 .screen {
   min-height: calc(100vh - var(--topbar-h));
-  padding: 16px;
+  min-height: calc(100dvh - var(--topbar-h));
+  padding: 16px 16px 260px;
   background: var(--bg-app);
   color: var(--text-primary);
 }
@@ -300,12 +308,13 @@ a { color: var(--accent); }
 /* -------- 4. Login screen -------- */
 .login {
   min-height: 100vh;
+  min-height: 100dvh;
   background: var(--bg-app);
   color: var(--text-primary);
   display: flex;
-  align-items: center;
+  align-items: flex-start;
   justify-content: center;
-  padding: 16px;
+  padding: 12px 16px 260px;
   position: relative;
 }
 .login__card {
@@ -550,7 +559,7 @@ a { color: var(--accent); }
   gap: 4px;
   background: transparent;
   border: 0;
-  color: var(--accent);
+  color: var(--accent-text);
   font: inherit;
   font-size: 0.85rem;
   font-weight: 600;
@@ -794,9 +803,9 @@ a { color: var(--accent); }
   background: rgba(15, 23, 42, 0.45);
   z-index: 300;
   display: flex;
-  align-items: center;
+  align-items: flex-start;
   justify-content: center;
-  padding: 16px;
+  padding: 12px;
 }
 .modal__content {
   background: var(--bg-app);
@@ -808,7 +817,8 @@ a { color: var(--accent); }
   overflow: hidden;
   display: flex;
   flex-direction: column;
-  max-height: 90vh;
+  max-height: calc(100vh - 24px);
+  max-height: calc(100dvh - 24px);
 }
 .modal__header {
   display: flex;
@@ -876,11 +886,11 @@ a { color: var(--accent); }
   display: flex;
   flex-direction: column;
   gap: 0;
-  padding-bottom: 80px;
+  padding-bottom: 260px;
 }
 .review-header {
   position: sticky;
-  top: 0;
+  top: var(--topbar-h);
   background: var(--bg-app);
   z-index: 10;
   border-bottom: 1px solid var(--border);
@@ -912,7 +922,7 @@ a { color: var(--accent); }
 }
 .review-tab__btn:active { opacity: 0.7; }
 .review-tab__btn.is-active {
-  color: var(--accent);
+  color: var(--accent-text);
   border-bottom-color: var(--accent);
 }
 .review-tab__count {
@@ -1032,7 +1042,10 @@ a { color: var(--accent); }
   font-size: 0.85rem;
   background: var(--bg-app);
   color: var(--text-primary);
-  max-width: 180px;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 .review-card__dist {
   color: var(--text-body);
@@ -1126,32 +1139,42 @@ a { color: var(--accent); }
   flex-direction: column;
   gap: 8px;
 }
+/* Legacy single-column list (used elsewhere, kept for back-compat). */
 .find-product__list {
   display: flex;
   flex-direction: column;
   gap: 6px;
 }
+/* New find-product modal grid: 3 columns of card-style tiles, sized to
+ * fit `visual_search_top_k` results comfortably on a 640×480 screen. */
+.find-product__grid {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 10px;
+  padding: 4px 0;
+}
 .product-card {
   display: flex;
-  gap: 10px;
-  align-items: center;
-  padding: 8px;
+  flex-direction: column;
+  gap: 6px;
+  align-items: stretch;
+  padding: 10px;
   border: 1px solid var(--border);
-  border-radius: 8px;
+  border-radius: 10px;
   background: var(--bg-app);
-  text-align: left;
+  text-align: center;
   cursor: pointer;
-  min-height: 56px;
+  min-height: 130px;
   width: 100%;
 }
 .product-card:active { opacity: 0.7; }
 .product-card__thumb {
-  width: 56px;
-  height: 56px;
-  border-radius: 6px;
+  width: 100%;
+  height: 96px;
+  border-radius: 8px;
   background: var(--bg-surface);
   object-fit: cover;
-  flex: 0 0 56px;
+  flex: 0 0 96px;
 }
 .product-card__col {
   flex: 1 1 auto;
@@ -1159,17 +1182,27 @@ a { color: var(--accent); }
   flex-direction: column;
   gap: 2px;
   min-width: 0;
+  text-align: center;
 }
 .product-card__name {
   font-weight: 600;
-  font-size: 0.9rem;
+  font-size: 0.85rem;
+  /* Truncate to 2 lines so long product names don't blow up the grid. */
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  line-height: 1.2;
 }
 .product-card__meta {
-  font-size: 0.78rem;
+  font-size: 0.72rem;
   color: var(--text-body);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 .product-card__sim {
-  font-size: 0.78rem;
+  font-size: 0.72rem;
   color: var(--text-body);
   font-variant-numeric: tabular-nums;
 }
@@ -1249,7 +1282,7 @@ a { color: var(--accent); }
   align-items: center;
   font-size: 0.9rem;
   cursor: pointer;
-  min-height: 36px;
+  min-height: 44px;
 }
 
 /* --- Floorplan tab --- */
@@ -1257,10 +1290,16 @@ a { color: var(--accent); }
   width: 100%;
   display: flex;
   justify-content: center;
+  /* Centred horizontally; the SVG itself is sized in JS based on the
+   * room's actual dimensions (see `_renderReviewFloorplanSvg`'s
+   * PX_PER_METRE cap). Don't force width:100% here — small rooms
+   * should NOT stretch to fill the screen. */
 }
 .review-floorplan-svg {
-  width: 100%;
-  max-height: 70vh;
+  /* width/height attributes set inline by the renderer. CSS just
+   * supplies a max-bound so the cap can't be defeated by zoom. */
+  max-width: 100%;
+  max-height: 60vh;
   background: var(--bg-surface);
   border-radius: 8px;
 }
@@ -1295,6 +1334,42 @@ a { color: var(--accent); }
 .review-merge-badge__bg { fill: var(--accent); }
 .review-merge-badge__text { fill: #FFF; font-weight: 700; }
 
+/* Single-scroll review layout — floorplan / furniture / notes stacked. */
+.review-section {
+  margin-bottom: 16px;
+}
+.review-section + .review-section {
+  border-top: 1px solid var(--border);
+  padding-top: 12px;
+}
+.review-section-summary {
+  font-size: 0.85rem;
+  color: var(--text-body);
+  padding: 8px 0;
+}
+
+/* Wall length labels — pill-style for legibility against the wall stroke. */
+.review-wall-len {
+  fill: var(--text-primary);
+  font-weight: 700;
+  paint-order: stroke fill;
+  stroke: rgba(255, 255, 255, 0.92);
+  stroke-width: 0.06;
+  stroke-linejoin: round;
+}
+
+/* Furniture class labels: high-contrast pill that floats over the rect.
+ * `paint-order: stroke fill` lets us draw a thick white halo around the
+ * dark text so it stays readable on top of the accent-tinted rect fill. */
+.review-furn-label {
+  fill: var(--text-primary);
+  font-weight: 700;
+  paint-order: stroke fill;
+  stroke: rgba(255, 255, 255, 0.92);
+  stroke-width: 0.05;
+  stroke-linejoin: round;
+}
+
 /* --- Notes tab --- */
 .review-notes {
   display: flex;
@@ -1304,7 +1379,8 @@ a { color: var(--accent); }
 }
 .review-notes__input {
   width: 100%;
-  min-height: 200px;
+  min-height: 120px;
+  max-height: 160px;
   padding: 10px;
   font-size: 16px;
   border: 1px solid var(--border);
@@ -1596,7 +1672,8 @@ a { color: var(--accent); }
 }
 .settings-textarea {
   width: 100%;
-  min-height: 200px;
+  min-height: 100px;
+  max-height: 160px;
   padding: 10px;
   border: 1px solid var(--border);
   border-radius: 6px;
@@ -1726,4 +1803,23 @@ a { color: var(--accent); }
   overflow-y: auto;
   color: var(--text-body);
 }
+
+/* CSS-9 — focus-visible rings on button-roled elements that lacked them. */
+.project-card:focus-visible,
+.scan-row:focus-visible,
+.product-card:focus-visible,
+.runs-list__row:focus-visible,
+.review-tab__btn:focus-visible,
+.review-card__action:focus-visible,
+.review-run-pill:focus-visible,
+.section__head:focus-visible,
+.review-mark-btn:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+/* CSS-11 — when on-screen keyboard is open, lift the toast above the OSK
+ * and hide the sticky multi-select bar so it doesn't collide with input. */
+body.osk-open .toast { bottom: 260px; }
+body.osk-open .review-sticky { display: none; }
 

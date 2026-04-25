@@ -364,5 +364,119 @@ class TestAdHocBucket(_RouteTestBase):
         self.assertIn(0, ad_hoc_ids)
 
 
+class TestCachedFlagIsOr(_RouteTestBase):
+    """BE-1: `cached` flips on when EITHER feed is stale, not only both.
+
+    Also verifies the new granular `scheduled_cached` / `history_cached`
+    flags ride along.
+    """
+
+    def test_cached_true_when_only_schedule_stale(self):
+        auth.write_token(_fresh_jwt())
+
+        sched_blob = [{'scan_id': 42}]
+        hist_blob = [{'scan_id': 7}]
+
+        def _fake_cached_get(key, ttl, fetch_fn):
+            if 'schedule' in key:
+                return athathi_proxy.StaleCacheResult(
+                    sched_blob, reason='network',
+                    fetched_at_iso='2026-04-25T11:00:00Z',
+                )
+            if 'history' in key:
+                return hist_blob  # fresh
+            raise AssertionError(f'unexpected cache key: {key}')
+
+        with mock.patch.object(athathi_proxy, 'cached_get',
+                               side_effect=_fake_cached_get):
+            r = self.client.get('/api/projects')
+
+        self.assertEqual(r.status_code, 200)
+        body = r.get_json()
+        self.assertTrue(body['cached'])
+        self.assertTrue(body['scheduled_cached'])
+        self.assertFalse(body['history_cached'])
+        # And the timestamp comes from the stale feed's `fetched_at_iso`.
+        self.assertEqual(body['fetched_at'], '2026-04-25T11:00:00Z')
+
+    def test_cached_true_when_only_history_stale(self):
+        auth.write_token(_fresh_jwt())
+
+        sched_blob = [{'scan_id': 42}]
+        hist_blob = [{'scan_id': 7}]
+
+        def _fake_cached_get(key, ttl, fetch_fn):
+            if 'schedule' in key:
+                return sched_blob
+            if 'history' in key:
+                return athathi_proxy.StaleCacheResult(
+                    hist_blob, reason='network',
+                    fetched_at_iso='2026-04-25T10:30:00Z',
+                )
+            raise AssertionError(f'unexpected cache key: {key}')
+
+        with mock.patch.object(athathi_proxy, 'cached_get',
+                               side_effect=_fake_cached_get):
+            r = self.client.get('/api/projects')
+
+        self.assertEqual(r.status_code, 200)
+        body = r.get_json()
+        self.assertTrue(body['cached'])
+        self.assertFalse(body['scheduled_cached'])
+        self.assertTrue(body['history_cached'])
+
+    def test_neither_stale_no_cached_flag(self):
+        auth.write_token(_fresh_jwt())
+
+        def _fake_cached_get(key, ttl, fetch_fn):
+            return []
+
+        with mock.patch.object(athathi_proxy, 'cached_get',
+                               side_effect=_fake_cached_get):
+            r = self.client.get('/api/projects')
+
+        body = r.get_json()
+        self.assertFalse(body['cached'])
+        self.assertFalse(body['scheduled_cached'])
+        self.assertFalse(body['history_cached'])
+
+
+class TestProjectsCacheFallbackEnvelope(_RouteTestBase):
+    """BE-2: when an upstream call hits a network failure and a stale cache
+    is on disk, the route must still return the merged envelope shape rather
+    than the bare cached blob.
+    """
+
+    def test_network_failure_with_stale_cache_returns_envelope(self):
+        auth.write_token(_fresh_jwt())
+
+        sched_blob = [{'scan_id': 42, 'customer_name': 'Cached'}]
+        hist_blob = [{'scan_id': 7, 'customer_name': 'Old'}]
+
+        # Pre-populate the cache files for the fallback to read.
+        sched_key = athathi_proxy.cache_key_for('schedule', auth.read_token())
+        hist_key = athathi_proxy.cache_key_for('history', auth.read_token())
+        athathi_proxy._write_cache(athathi_proxy._cache_path(sched_key), sched_blob)
+        athathi_proxy._write_cache(athathi_proxy._cache_path(hist_key), hist_blob)
+
+        # Simulate cached_get raising network errors (no cache fallback yet
+        # at the proxy layer — the route is responsible for the envelope).
+        def _fake_cached_get(key, ttl, fetch_fn):
+            raise athathi_proxy.AthathiError(0, '', 'Network unreachable')
+
+        with mock.patch.object(athathi_proxy, 'cached_get',
+                               side_effect=_fake_cached_get):
+            r = self.client.get('/api/projects')
+
+        self.assertEqual(r.status_code, 200)
+        body = r.get_json()
+        # Envelope shape preserved.
+        self.assertIn('scheduled', body)
+        self.assertIn('history', body)
+        self.assertIn('ad_hoc', body)
+        self.assertTrue(body['cached'])
+        self.assertEqual(r.headers.get('X-Cached'), 'true')
+
+
 if __name__ == '__main__':
     unittest.main()

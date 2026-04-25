@@ -83,6 +83,15 @@ DEFAULT_CONFIG = {
     "post_submit_hook": None,
     "image_transport":  "multipart",
     "visual_search_cache_ttl_s": 86400,
+    # `visual_search_top_k`: how many candidate products the modal grid
+    # is laid out for. The Athathi backend currently returns ~6 (no top_k
+    # query param exposed) — we render whatever it sends, but reserve grid
+    # slots up to this number so a future top_k bump just works.
+    "visual_search_top_k": 6,
+    # `visual_search_prefetch`: when true, the review screen kicks off a
+    # background prefetch for every bbox the moment results load — modal
+    # opens instantly because the result is already in the disk cache.
+    "visual_search_prefetch": True,
 }
 
 

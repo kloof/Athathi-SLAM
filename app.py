@@ -23,7 +23,7 @@ import sys
 import threading
 import time
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 
 
 import cv2
@@ -692,15 +692,47 @@ def api_status():
     active_session = None
     camera_recording = None
     camera_frames = None
+    in_flight = bool(_active_recording.get('starting')) or recording
+    inflight_status = 'idle'
     if recording and _active_recording['start_time']:
         elapsed = round(time.time() - _active_recording['start_time'], 1)
         active_session = _active_recording['session_id']
+        sess = _get_session(active_session) if active_session else None
+        inflight_status = (sess.get('status', 'recording') if sess else 'recording')
         if _active_recording.get('camera_ok'):
             camera_recording = bool(_active_recording.get('camera_streaming'))
             camera_frames = int(_active_recording.get('camera_frames') or 0)
         else:
             camera_recording = False
             camera_frames = 0
+    elif in_flight:
+        # Pre-bag window: surface the in-flight session's status so the SPA
+        # fallback poll can flip the Stop button on without waiting for SSE.
+        active_session = _active_recording.get('session_id')
+        sess = _get_session(active_session) if active_session else None
+        inflight_status = (sess.get('status', 'starting') if sess else 'starting')
+
+    # Mirror the SSE processing-snapshot so the SPA's polling fallback can
+    # keep the timer + stage label fresh when EventSource drops on Chromium
+    # kiosk. Same lock discipline as `/api/events` (Step 5 / plan §22b).
+    processing = {}
+    with _processing_lock:
+        proc_snapshot = {sid: dict(proc) for sid, proc in _active_processing.items()}
+    for sid, proc in proc_snapshot.items():
+        stage = proc.get('stage') or proc.get('status') or ''
+        err_msg = None
+        sess_for_err = _get_session(sid)
+        if isinstance(sess_for_err, dict):
+            err_msg = sess_for_err.get('slam_error')
+        processing[sid] = {
+            'status': proc.get('status'),
+            'stage': stage,
+            'progress': stage,
+            'job_id': proc.get('job_id'),
+            'elapsed': round(time.time() - proc.get('start_time', time.time()), 1),
+            'run_id': proc.get('run_id'),
+            'error': err_msg,
+        }
 
     return jsonify({
         'network': {'ok': net_ok, 'message': net_msg},
@@ -711,10 +743,13 @@ def api_status():
             'extrinsics': os.path.isfile(EXTRINSICS_FILE),
         },
         'recording': recording,
+        'in_flight': in_flight,
+        'inflight_status': inflight_status,
         'elapsed': elapsed,
         'active_session': active_session,
         'camera_recording': camera_recording,
         'camera_frames': camera_frames,
+        'processing': processing,
     })
 
 
@@ -1359,12 +1394,27 @@ def api_events():
             elapsed = 0
             status = 'idle'
             session_id = None
+            # `in_flight` covers the pre-bag window: the recording thread is
+            # alive (driver launching / waiting for LiDAR topics) but
+            # `_is_recording()` is still False because the bag subprocess
+            # hasn't spawned. Without this the SPA's Stop button never
+            # appears for 30-50 s after Start. Mirrors `_is_busy()`.
+            in_flight = bool(_active_recording.get('starting')) or recording
 
             if recording and _active_recording['start_time']:
                 elapsed = round(time.time() - _active_recording['start_time'], 1)
                 session_id = _active_recording['session_id']
                 session = _get_session(session_id) if session_id else None
                 status = session.get('status', 'recording') if session else 'recording'
+            elif in_flight:
+                # Pre-bag window: surface the in-flight session's current
+                # status (`launching_driver` / `waiting_for_topics` / `starting`)
+                # so the SPA can render the Stop button + intermediate stage
+                # rather than sitting on `idle`.
+                session_id = _active_recording.get('session_id')
+                session = _get_session(session_id) if session_id else None
+                status = (session.get('status', 'starting') if session
+                          else 'starting')
 
             # Collect processing status for active SLAM jobs.
             # Snapshot under lock so we don't race with _process_thread.
@@ -1398,6 +1448,7 @@ def api_events():
 
             data = json.dumps({
                 'recording': recording,
+                'in_flight': in_flight,
                 'elapsed': elapsed,
                 'status': status,
                 'session_id': session_id,
@@ -2278,6 +2329,12 @@ def api_auth_login():
 def api_auth_logout():
     """Best-effort upstream logout; always clears the local token + auth.json."""
     token = auth.read_token()
+    # BE-6: when there's no local token, there's nothing for the upstream
+    # to invalidate either. Skip the upstream call so we don't waste a
+    # network round-trip (and don't risk a transient 401 in the logs).
+    if token is None:
+        auth.clear_token()
+        return jsonify({'ok': True}), 200
     # Upstream call is best-effort; never blocks the local clear.
     try:
         athathi_proxy.logout(token)
@@ -2622,6 +2679,31 @@ def api_projects():
     sched_key = athathi_proxy.cache_key_for('schedule', tok)
     hist_key = athathi_proxy.cache_key_for('history', tok)
 
+    # BE-2: when an upstream call raises a network failure AND a stale cache
+    # is on disk, build a synthetic StaleCacheResult so the route's merge
+    # logic still produces the expected `{scheduled, history, ad_hoc, cached,
+    # fetched_at}` envelope. Without this the bare-blob shape from
+    # `_athathi_handle_error` confuses the SPA. For 401 / 5xx / no-cache
+    # network failures, we still defer to `_athathi_handle_error`.
+    def _project_feed_cache_fallback(err, cache_key):
+        if err.status_code != 0:
+            return None  # not a network failure — caller falls through
+        path = athathi_proxy._cache_path(cache_key)
+        ts, blob = athathi_proxy._read_cache(path)
+        if blob is None:
+            return None
+        fetched_at_iso = None
+        try:
+            if isinstance(ts, (int, float)):
+                fetched_at_iso = datetime.fromtimestamp(
+                    ts, tz=timezone.utc,
+                ).isoformat().replace('+00:00', 'Z')
+        except (OverflowError, OSError, ValueError):
+            fetched_at_iso = None
+        return athathi_proxy.StaleCacheResult(
+            blob, reason='network', fetched_at_iso=fetched_at_iso,
+        )
+
     # Fetch schedule.
     try:
         sched_result = athathi_proxy.cached_get(
@@ -2629,7 +2711,9 @@ def api_projects():
             fetch_fn=lambda: athathi_proxy.get_schedule(tok),
         )
     except athathi_proxy.AthathiError as e:
-        return _athathi_handle_error(e, cache_key=sched_key)
+        sched_result = _project_feed_cache_fallback(e, sched_key)
+        if sched_result is None:
+            return _athathi_handle_error(e, cache_key=sched_key)
 
     # Fetch history.
     try:
@@ -2638,7 +2722,9 @@ def api_projects():
             fetch_fn=lambda: athathi_proxy.get_history(tok),
         )
     except athathi_proxy.AthathiError as e:
-        return _athathi_handle_error(e, cache_key=hist_key)
+        hist_result = _project_feed_cache_fallback(e, hist_key)
+        if hist_result is None:
+            return _athathi_handle_error(e, cache_key=hist_key)
 
     sched_stale = isinstance(sched_result, athathi_proxy.StaleCacheResult)
     hist_stale = isinstance(hist_result, athathi_proxy.StaleCacheResult)
@@ -2648,16 +2734,24 @@ def api_projects():
 
     merged = _projects_render_merged(sched_blob, hist_blob)
     merged['now'] = datetime.utcnow().isoformat() + 'Z'
-    merged['cached'] = bool(sched_stale and hist_stale)
+    # BE-1: surface a top-level `cached` flag whenever EITHER feed is stale,
+    # not only when both are. The frontend banner reflects "any stale data
+    # is being shown". Granular `scheduled_cached` / `history_cached` flags
+    # let the UI distinguish a partial outage if it ever wants to.
+    merged['scheduled_cached'] = bool(sched_stale)
+    merged['history_cached'] = bool(hist_stale)
+    merged['cached'] = bool(sched_stale or hist_stale)
 
-    # When BOTH calls served stale cache, surface the actual last-refresh
+    # When ANY call served stale cache, surface the actual last-refresh
     # time so the frontend banner can render an honest "last refreshed <ago>"
     # (instead of using `now`, which is just the response timestamp). We
-    # take the OLDEST of the two cache timestamps — the banner reflects the
-    # least-fresh data the user is currently viewing.
+    # take the OLDEST of the available cache timestamps — the banner reflects
+    # the least-fresh data the user is currently viewing.
     if merged['cached']:
         ts_candidates = []
-        for r in (sched_result, hist_result):
+        for r, is_stale in ((sched_result, sched_stale), (hist_result, hist_stale)):
+            if not is_stale:
+                continue
             ts = getattr(r, 'fetched_at_iso', None)
             if isinstance(ts, str) and ts:
                 ts_candidates.append(ts)
@@ -2838,6 +2932,18 @@ def _scoped_recording_thread(session_id, scan_id, scan_name):
         # Ensure the directory exists; create_scan made it but a manual
         # delete + ad-hoc start could race here. Keep the recording resilient.
         os.makedirs(output_dir, exist_ok=True)
+        # ros2 bag record refuses to overwrite an existing output dir and
+        # exits ~1 s after launch ("Output directory already exists"). Scan
+        # dirs use fixed names like `48__scan_1` so every re-record on the
+        # same scan would collide. Wipe the prior rosbag/ subtree so the
+        # technician's fresh "Start recording" tap actually starts.
+        prior_bag_dir = os.path.join(output_dir, 'rosbag')
+        if os.path.isdir(prior_bag_dir):
+            try:
+                shutil.rmtree(prior_bag_dir)
+                _log(f'[scoped] Wiped prior bag dir {prior_bag_dir}')
+            except OSError as e:
+                _log(f'[scoped] Warning: could not wipe {prior_bag_dir}: {e!r}')
         bag_proc = _start_bag_record(output_dir, topics)
 
         _active_recording['session_id'] = session_id
@@ -3029,11 +3135,61 @@ def _scoped_save_done_artifacts(session_id, job_id, envelope, run_dir):
     _put_session(session_id, sess)
 
 
-def _scoped_process_thread(session_id, mcap_path, run_dir):
+def _scoped_apply_carry_over(scan_id, scan_name, new_run_dir, prior_run_dir):
+    """BE-4: migrate the technician's review from the previous active run
+    onto the freshly-completed run.
+
+    No-ops when no prior review exists. On success, persists the new
+    review.json (with `carry_over_warnings` populated). Read-modify-write
+    is serialised under the per-scan review-write lock.
+    """
+    if not prior_run_dir or not os.path.isdir(prior_run_dir):
+        return
+    # `_review` is the late-imported module above (Step 5 block).
+    old_review = _review.read_review(prior_run_dir)
+    if not isinstance(old_review, dict):
+        return
+    old_result_path = os.path.join(prior_run_dir, 'result.json')
+    new_result_path = os.path.join(new_run_dir, 'result.json')
+    try:
+        with open(old_result_path, 'r') as f:
+            old_result = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return
+    try:
+        with open(new_result_path, 'r') as f:
+            new_result = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return
+    try:
+        new_review, warnings = _review.carry_over_review(
+            old_review, old_result, new_result,
+        )
+    except (TypeError, ValueError) as e:
+        _log(f'[scoped] carry_over_review rejected: {e!r}')
+        return
+    if isinstance(warnings, list) and warnings:
+        new_review = dict(new_review)
+        new_review['carry_over_warnings'] = warnings
+    if scan_id is not None and scan_name is not None:
+        with _review_lock_for(scan_id, scan_name):
+            _review.write_review(new_run_dir, new_review)
+    else:
+        _review.write_review(new_run_dir, new_review)
+
+
+def _scoped_process_thread(session_id, mcap_path, run_dir,
+                           scan_id=None, scan_name=None, prior_run_dir=None):
     """Mirror of `_process_thread`, writing artifacts under `run_dir`.
 
     Locking + cancellation semantics are identical so the SSE / cancel /
     recovery code paths Just Work.
+
+    BE-4: when the new run completes successfully and a `prior_run_dir`
+    was passed (i.e. there was a previous active run with a technician
+    review on disk), call `review.carry_over_review` to migrate the prior
+    review state onto the new run, persisting any warnings to the new
+    `review.json["carry_over_warnings"]`.
     """
     os.makedirs(run_dir, exist_ok=True)
     zst_path = os.path.join(run_dir, 'scan.mcap.zst')
@@ -3129,6 +3285,13 @@ def _scoped_process_thread(session_id, mcap_path, run_dir):
 
             if stage == 'done':
                 _scoped_save_done_artifacts(session_id, job_id, envelope, run_dir)
+                # BE-4: carry over the prior run's review state, if any.
+                try:
+                    _scoped_apply_carry_over(
+                        scan_id, scan_name, run_dir, prior_run_dir,
+                    )
+                except Exception as carry_err:
+                    _log(f'[scoped] carry-over failed for {session_id}: {carry_err!r}')
                 return
 
             continue
@@ -3356,6 +3519,15 @@ def api_scoped_process(scan_id, scan_name):
     if not mcap_path:
         return jsonify({'error': 'No MCAP file found for scan'}), 404
 
+    # BE-4: capture the prior active-run info BEFORE we override it so the
+    # processing thread can carry-over the technician's review state from
+    # the old run to the new run on completion.
+    prior_run_id = _projects.read_active_run(scan_id, scan_name)
+    prior_run_dir = (
+        _projects.processed_dir_for_run(scan_id, scan_name, prior_run_id)
+        if prior_run_id else None
+    )
+
     # Allocate a fresh run id and make it the active run.
     run_id = _projects.allocate_run_id(scan_id, scan_name)
     run_dir = _projects.processed_dir_for_run(scan_id, scan_name, run_id)
@@ -3398,6 +3570,11 @@ def api_scoped_process(scan_id, scan_name):
     thread = threading.Thread(
         target=_scoped_process_thread,
         args=(session_id, mcap_path, run_dir),
+        kwargs={
+            'scan_id': int(scan_id),
+            'scan_name': str(scan_name),
+            'prior_run_dir': prior_run_dir,
+        },
         daemon=True,
     )
     thread.start()
@@ -3679,6 +3856,25 @@ def _recapture_lock_for(scan_id, scan_name):
         return lock
 
 
+# BE-3: per-(scan_id, scan_name) review-write lock. Mirrors the recapture
+# pattern; the recapture lock STAYS (it serialises the ffmpeg call), and this
+# new lock layers under it for the JSON-write phase. Two simultaneous PATCH
+# / merge / mark-reviewed / link-product / recapture writes against the
+# SAME review.json would otherwise race on read-modify-write.
+_review_locks_outer = threading.Lock()
+_review_locks = {}  # (scan_id:int, scan_name:str) -> threading.Lock()
+
+
+def _review_lock_for(scan_id, scan_name):
+    key = (int(scan_id), scan_name)
+    with _review_locks_outer:
+        lock = _review_locks.get(key)
+        if lock is None:
+            lock = threading.Lock()
+            _review_locks[key] = lock
+        return lock
+
+
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
@@ -3758,7 +3954,13 @@ def _review_brio_snapshot(dst_path):
 
     Time-budget: 10 s. /dev/video0 is hard-coded — `camera_node.py` lives
     with that assumption too.
+
+    /dev/video0 contention: the recapture overlay's <img src=/api/camera/preview>
+    holds /dev/video0 via `_active_preview`. ffmpeg here would otherwise fail
+    with "Device or resource busy". Release the preview first, then take the
+    snapshot. The next preview GET re-spawns it cleanly.
     """
+    _release_camera_device(timeout=3.0)
     cmd = [
         'ffmpeg', '-hide_banner', '-loglevel', 'error',
         '-f', 'v4l2', '-video_size', '1920x1080',
@@ -3890,29 +4092,33 @@ def api_scoped_review_patch(scan_id, scan_name):
                 'valid_count': len(valid_bbox_ids),
             }), 400
 
-    try:
-        if has_notes:
-            rv = _review.set_notes(rv, data.get('notes'))
-        else:
-            bid = data['bbox_id']
-            if not isinstance(bid, str) or not bid:
-                return jsonify({'error': 'bbox_id must be a non-empty string'}), 400
-            if 'status' in data:
-                status = data['status']
-                # Pass any extra bookkeeping fields (e.g. reason) through.
-                extras = {k: v for k, v in data.items()
-                          if k not in ('bbox_id', 'status')}
-                rv = _review.set_bbox_status(rv, bid, status, **extras)
-            elif 'class_override' in data:
-                rv = _review.set_class_override(rv, bid, data['class_override'])
-            elif 'image_override' in data:
-                rv = _review.set_image_override(rv, bid, data['image_override'])
-            elif 'linked_product' in data:
-                rv = _review.set_linked_product(rv, bid, data['linked_product'])
-    except (ValueError, TypeError) as e:
-        return jsonify({'error': str(e)}), 400
+    # BE-3: serialise the read-modify-write phase per (scan_id, scan_name)
+    # so concurrent PATCHes don't clobber each other.
+    with _review_lock_for(scan_id, scan_name):
+        rv = _review_load_or_init(scan_id, scan_name, rdir)
+        try:
+            if has_notes:
+                rv = _review.set_notes(rv, data.get('notes'))
+            else:
+                bid = data['bbox_id']
+                if not isinstance(bid, str) or not bid:
+                    return jsonify({'error': 'bbox_id must be a non-empty string'}), 400
+                if 'status' in data:
+                    status = data['status']
+                    # Pass any extra bookkeeping fields (e.g. reason) through.
+                    extras = {k: v for k, v in data.items()
+                              if k not in ('bbox_id', 'status')}
+                    rv = _review.set_bbox_status(rv, bid, status, **extras)
+                elif 'class_override' in data:
+                    rv = _review.set_class_override(rv, bid, data['class_override'])
+                elif 'image_override' in data:
+                    rv = _review.set_image_override(rv, bid, data['image_override'])
+                elif 'linked_product' in data:
+                    rv = _review.set_linked_product(rv, bid, data['linked_product'])
+        except (ValueError, TypeError) as e:
+            return jsonify({'error': str(e)}), 400
 
-    _review.write_review(rdir, rv)
+        _review.write_review(rdir, rv)
     return jsonify({'ok': True, 'run_id': rid, 'review': rv}), 200
 
 
@@ -3946,54 +4152,56 @@ def api_scoped_review_merge(scan_id, scan_name):
     if result is None:
         return jsonify({'error': 'result.json missing for run'}), 404
 
-    rv = _review_load_or_init(scan_id, scan_name, rdir)
-    existing_bxs = rv.get('bboxes') or {}
+    # BE-3: per-scan review-write lock around read-modify-write.
+    with _review_lock_for(scan_id, scan_name):
+        rv = _review_load_or_init(scan_id, scan_name, rdir)
+        existing_bxs = rv.get('bboxes') or {}
 
-    try:
-        delta = _review.merge_bboxes(
-            result, primary_id, member_ids,
-            chosen_class=chosen_class,
-            existing_review=existing_bxs)
-    except TypeError as e:
-        return jsonify({'error': str(e)}), 400
-    except ValueError as e:
-        msg = str(e)
-        # Re-merge of an already-merged member into a DIFFERENT primary
-        # is a state conflict, not a malformed request: surface as 409.
-        if 'already merged into' in msg:
-            return jsonify({'error': msg}), 409
-        return jsonify({'error': msg}), 400
+        try:
+            delta = _review.merge_bboxes(
+                result, primary_id, member_ids,
+                chosen_class=chosen_class,
+                existing_review=existing_bxs)
+        except TypeError as e:
+            return jsonify({'error': str(e)}), 400
+        except ValueError as e:
+            msg = str(e)
+            # Re-merge of an already-merged member into a DIFFERENT primary
+            # is a state conflict, not a malformed request: surface as 409.
+            if 'already merged into' in msg:
+                return jsonify({'error': msg}), 409
+            return jsonify({'error': msg}), 400
 
-    bxs = dict(existing_bxs)
-    # The delta's `merged_from` list contains only the NEW members for this
-    # call (idempotent skips were stripped by review.merge_bboxes). Fold
-    # them into the primary's existing list rather than overwriting, so a
-    # follow-up merge of additional members onto the same primary keeps
-    # earlier members intact.
-    primary_state = dict(delta.get(primary_id) or {})
-    new_members = list(primary_state.get('merged_from') or [])
-    prior_primary = bxs.get(primary_id)
-    if isinstance(prior_primary, dict):
-        prior_members = prior_primary.get('merged_from')
-        if isinstance(prior_members, list) and prior_members:
-            seen = set(prior_members)
-            combined = list(prior_members)
-            for m in new_members:
-                if m not in seen:
-                    combined.append(m)
-                    seen.add(m)
-            primary_state['merged_from'] = combined
-    cur_primary = dict(bxs.get(primary_id) or {})
-    cur_primary.update(primary_state)
-    bxs[primary_id] = cur_primary
-    for bid, state in delta.items():
-        if bid == primary_id:
-            continue
-        cur = dict(bxs.get(bid) or {})
-        cur.update(state)
-        bxs[bid] = cur
-    rv['bboxes'] = bxs
-    _review.write_review(rdir, rv)
+        bxs = dict(existing_bxs)
+        # The delta's `merged_from` list contains only the NEW members for this
+        # call (idempotent skips were stripped by review.merge_bboxes). Fold
+        # them into the primary's existing list rather than overwriting, so a
+        # follow-up merge of additional members onto the same primary keeps
+        # earlier members intact.
+        primary_state = dict(delta.get(primary_id) or {})
+        new_members = list(primary_state.get('merged_from') or [])
+        prior_primary = bxs.get(primary_id)
+        if isinstance(prior_primary, dict):
+            prior_members = prior_primary.get('merged_from')
+            if isinstance(prior_members, list) and prior_members:
+                seen = set(prior_members)
+                combined = list(prior_members)
+                for m in new_members:
+                    if m not in seen:
+                        combined.append(m)
+                        seen.add(m)
+                primary_state['merged_from'] = combined
+        cur_primary = dict(bxs.get(primary_id) or {})
+        cur_primary.update(primary_state)
+        bxs[primary_id] = cur_primary
+        for bid, state in delta.items():
+            if bid == primary_id:
+                continue
+            cur = dict(bxs.get(bid) or {})
+            cur.update(state)
+            bxs[bid] = cur
+        rv['bboxes'] = bxs
+        _review.write_review(rdir, rv)
 
     return jsonify({
         'ok': True,
@@ -4084,12 +4292,15 @@ def api_scoped_review_recapture(scan_id, scan_name, idx):
             }), 503
 
         # Persist the override on review.json.
-        rv = _review_load_or_init(scan_id, scan_name, rdir)
-        try:
-            rv = _review.set_image_override(rv, bbox_id, rel)
-        except (ValueError, TypeError) as e:
-            return jsonify({'error': str(e)}), 500
-        _review.write_review(rdir, rv)
+        # BE-3: layer the review-write lock under the recapture lock so
+        # the JSON-write phase serialises against PATCH / merge / mark.
+        with _review_lock_for(scan_id, scan_name):
+            rv = _review_load_or_init(scan_id, scan_name, rdir)
+            try:
+                rv = _review.set_image_override(rv, bbox_id, rel)
+            except (ValueError, TypeError) as e:
+                return jsonify({'error': str(e)}), 500
+            _review.write_review(rdir, rv)
 
         size = 0
         try:
@@ -4124,9 +4335,11 @@ def api_scoped_review_mark_reviewed(scan_id, scan_name):
     if err is not None:
         return err
 
-    rv = _review_load_or_init(scan_id, scan_name, rdir)
-    rv = _review.mark_reviewed(rv)
-    _review.write_review(rdir, rv)
+    # BE-3: per-scan review-write lock.
+    with _review_lock_for(scan_id, scan_name):
+        rv = _review_load_or_init(scan_id, scan_name, rdir)
+        rv = _review.mark_reviewed(rv)
+        _review.write_review(rdir, rv)
     return jsonify({'ok': True, 'run_id': rid, 'review': rv}), 200
 
 
@@ -5042,12 +5255,18 @@ def api_scoped_review_find_product(scan_id, scan_name, idx):
     except athathi_proxy.AthathiError as e:
         return _athathi_handle_error(e)
 
-    # Cache the upstream response when caching is enabled.
+    # Cache the upstream response when caching is enabled. BE-5: skip the
+    # cache write for empty / failed responses — caching a result-less reply
+    # would lock the user into "no matches" until the TTL expires.
     if ttl > 0:
-        try:
-            _vs_cache_write(cache_key, body)
-        except OSError as e:
-            _log(f'find_product: cache write failed: {e!r}')
+        results_list = (body.get('results') if isinstance(body, dict) else None)
+        has_results = isinstance(results_list, list) and len(results_list) > 0
+        upstream_error = isinstance(body, dict) and bool(body.get('error'))
+        if has_results and not upstream_error:
+            try:
+                _vs_cache_write(cache_key, body)
+            except OSError as e:
+                _log(f'find_product: cache write failed: {e!r}')
 
     payload = dict(body) if isinstance(body, dict) else body
     if isinstance(payload, dict):
@@ -5107,12 +5326,14 @@ def api_scoped_review_link_product(scan_id, scan_name):
         if isinstance(username, str) and username.strip():
             product['linked_by'] = username.strip()
 
-    rv = _review_load_or_init(scan_id, scan_name, rdir)
-    try:
-        rv = _review.set_linked_product(rv, bbox_id, product)
-    except (ValueError, TypeError) as e:
-        return jsonify({'error': str(e)}), 400
-    _review.write_review(rdir, rv)
+    # BE-3: per-scan review-write lock around read-modify-write.
+    with _review_lock_for(scan_id, scan_name):
+        rv = _review_load_or_init(scan_id, scan_name, rdir)
+        try:
+            rv = _review.set_linked_product(rv, bbox_id, product)
+        except (ValueError, TypeError) as e:
+            return jsonify({'error': str(e)}), 400
+        _review.write_review(rdir, rv)
 
     return jsonify({
         'ok': True,

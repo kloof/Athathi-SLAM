@@ -685,9 +685,11 @@
      */
     function _runSubmitRetrySweep(pending) {
         if (!Array.isArray(pending) || !pending.length) {
-            return Promise.resolve({ cleared: [] });
+            return Promise.resolve({ cleared: [], failed: [] });
         }
         var cleared = [];
+        var failed = [];
+        var any401 = false;
         var work = pending.map(function (p) {
             var sid = p.scan_id;
             return fetchJson(
@@ -712,10 +714,27 @@
                 if (ok) {
                     cleared.push(sid);
                     showToast('Project #' + sid + ' synced ✓', 'success');
+                } else {
+                    failed.push(sid);
                 }
-            }).catch(function () { /* silent — next sweep retries */ });
+            }).catch(function (err) {
+                // JS-6: track failure so we can surface it after the loop.
+                failed.push(sid);
+                if (err && err.status === 401) any401 = true;
+            });
         });
-        return Promise.all(work).then(function () { return { cleared: cleared }; });
+        return Promise.all(work).then(function () {
+            // JS-6: if any project still failed after the sweep, surface a
+            // single aggregated toast and direct the user to Settings.
+            if (failed.length) {
+                var nWord = failed.length === 1 ? 'project' : 'projects';
+                showToast(failed.length + ' ' + nWord + ' failed to sync — check Settings', 'warn');
+                if (any401) {
+                    try { location.hash = '#/login'; } catch (_) { /* ignore */ }
+                }
+            }
+            return { cleared: cleared, failed: failed };
+        });
     }
 
     function renderProjects() {
@@ -1117,14 +1136,15 @@
                     stepEl.textContent = phases[idx];
                 }
             }, 1500);
-            // Stash on the bodyHost so renderResult can clear it.
-            bodyHost._phaseTimer = timer;
+            // JS-7: track via state.pollTimers so clearScreenTimers() cleans
+            // it up on hash navigation.
+            state.pollTimers.submitPhase = timer;
         }
 
         function clearPhaseTimer() {
-            if (bodyHost._phaseTimer) {
-                clearInterval(bodyHost._phaseTimer);
-                bodyHost._phaseTimer = null;
+            if (state.pollTimers.submitPhase) {
+                clearInterval(state.pollTimers.submitPhase);
+                delete state.pollTimers.submitPhase;
             }
         }
 
@@ -1180,7 +1200,13 @@
             var body = (err && err.body) || {};
             var headline;
             var detail = '';
-            if (status === 400) {
+            // JS-5: 4xx status codes (except plain 400) are not retriable —
+            // the cause must be fixed first. 413 in particular signals the
+            // payload exceeds upstream limits.
+            var isClient4xx = status >= 400 && status < 500;
+            if (status === 413) {
+                headline = '✕ Project too large to upload — contact ops.';
+            } else if (status === 400) {
                 headline = '✕ Cannot submit — ' + ((body && body.error) || 'gating failed');
             } else if (status === 502) {
                 headline = '✕ Submit failed — try again';
@@ -1189,6 +1215,8 @@
                 } else if (body && body.error) {
                     detail = String(body.error);
                 }
+            } else if (isClient4xx) {
+                headline = '✕ Cannot submit — ' + ((body && body.error) || ('HTTP ' + status));
             } else {
                 headline = '✕ Submit failed — ' + ((err && err.message) || 'try again');
             }
@@ -1203,14 +1231,16 @@
                 class: 'btn-secondary btn-lg',
                 on: { click: function () { closeModal(); } },
             }, 'Close');
-            // 400 (gating) = no retry; 502 + others = retry.
+            // 4xx (client / gating) = no retry; 5xx + others = retry.
             var children = [cancelBtn];
-            if (status !== 400) {
+            if (!isClient4xx) {
                 var retryBtn = el('button', {
                     class: 'btn-primary btn-lg',
                     on: { click: function () { runSubmit(); } },
                 }, 'Retry');
                 children.push(retryBtn);
+            } else {
+                showToast('Cannot retry — fix the cause and try again.', 'warn');
             }
             bodyHost.appendChild(el('div', { class: 'modal__actions' }, children));
         }
@@ -1531,11 +1561,29 @@
      * 'done_unreviewed', 'done_reviewing', 'done_reviewed', 'error'.
      */
     function _scanState(scan, sse, result) {
-        if (sse && sse.recording && sse.scanName === scan.name) return 'recording';
+        // Single-tenant Pi: ANY in-flight recording belongs to whatever scan
+        // the technician is looking at. Mirror the legacy `updateRecordingUI`
+        // logic: `d.recording` true → recording; intermediate session
+        // statuses (launching_driver / waiting_for_topics / starting) also
+        // count as "recording-in-flight" so the Stop button appears
+        // immediately, not after a 30+ s topic-wait.
+        var INFLIGHT_REC_STATUSES = {
+            recording: 1,
+            starting: 1,
+            launching_driver: 1,
+            waiting_for_topics: 1,
+        };
+        // `in_flight` is the canonical "any recording in progress" flag from
+        // the SSE feed (covers pre-bag launching_driver / waiting_for_topics
+        // window). `recording` alone is only true once the bag spawns.
+        if (sse && (sse.in_flight || sse.recording)) return 'recording';
+        if (sse && sse.status && INFLIGHT_REC_STATUSES[sse.status]) return 'recording';
         var procMap = (sse && sse.processing) || {};
         for (var sid in procMap) {
             if (!Object.prototype.hasOwnProperty.call(procMap, sid)) continue;
-            if ((procMap[sid] || {}).scan_name === scan.name) return 'processing';
+            // Single-tenant: any active processing job belongs to this scan
+            // when we're on the scan workspace. (No multi-tenant routing yet.)
+            return 'processing';
         }
         if (result && result.status === 'processing') return 'processing';
         if (result && result.status === 'error') return 'error';
@@ -1573,7 +1621,16 @@
                 case 'idle': return 'idle';
                 case 'recording':
                     var sse = state.lastSse || {};
-                    return 'recording ' + fmtMmSs(sse.elapsed || 0);
+                    // Show the live session status (launching_driver,
+                    // waiting_for_topics, recording, …) so the user sees
+                    // progress during the 30-50 s pre-bag window, matching
+                    // the legacy `updateRecordingUI` `stateEl.textContent =
+                    // d.status` behaviour.
+                    var label = sse.status || 'recording';
+                    if (sse.recording) {
+                        return label + ' ' + fmtMmSs(sse.elapsed || 0);
+                    }
+                    return label + '…';
                 case 'recorded': return 'recorded — ready to process';
                 case 'processing':
                     var sse2 = state.lastSse || {};
@@ -1729,14 +1786,60 @@
         }
 
         function startRecording() {
+            // The POST returns 200 immediately while the recording thread
+            // does the actual setup (network, driver, /dev/video0, ROS bag).
+            // Optimistic UI lies: poll status briefly and surface real errors.
+            showToast('Starting recording...');
             fetchJson('POST',
                 '/api/project/' + encodeURIComponent(scanId) + '/scan/'
                 + encodeURIComponent(scanName) + '/start_recording'
             ).then(function () {
-                showToast('Recording started');
+                _verifyRecordingStarted();
             }).catch(function (e) {
                 showToast(e.message || 'Could not start recording', 'error');
             });
+        }
+
+        function _verifyRecordingStarted() {
+            // Poll /api/status and the scan list for up to ~35s — that covers
+            // the LiDAR topic-wait timeout in _wait_for_topics. If the
+            // backend's `recording` flag flips on, we're good. If the
+            // matching session record shows status='error', surface it.
+            var attempts = 0;
+            var maxAttempts = 35;
+            var iv = setInterval(function () {
+                // JS-3: increment FIRST, regardless of fetch outcome — if the
+                // network drops the timer would otherwise tick forever.
+                attempts++;
+                if (attempts >= maxAttempts) {
+                    clearInterval(iv);
+                    showToast('Recording is still starting — check the scan workspace.', 'warn');
+                    loadAll();
+                    return;
+                }
+                fetchJson('GET', '/api/status').then(function (s) {
+                    if (s && s.recording) {
+                        clearInterval(iv);
+                        showToast('✓ Recording', 'success');
+                        loadAll();
+                        return;
+                    }
+                    // Not yet recording — check if a recent session errored.
+                    fetchJson('GET', '/api/sessions').then(function (sessions) {
+                        var match = (sessions || []).find(function (x) {
+                            return x.name === scanId + '__' + scanName;
+                        });
+                        if (match && match.status === 'error') {
+                            clearInterval(iv);
+                            showToast('Recording failed: ' + (match.error || 'unknown error'), 'error');
+                            loadAll();
+                            return;
+                        }
+                    }).catch(function () { /* keep polling */ });
+                }).catch(function () { /* keep polling */ });
+            }, 1000);
+            // Track so screen-leave clears it.
+            state.pollTimers.recVerify = iv;
         }
 
         function stopRecording() {
@@ -1758,9 +1861,45 @@
             ).then(function () {
                 showToast('Processing started');
                 loadAll();
+                _verifyProcessStarted(scanId, scanName);
             }).catch(function (e) {
                 showToast(e.message || 'Could not start processing', 'error');
             });
+        }
+
+        function _verifyProcessStarted(_scanId, _scanName) {
+            // JS-4: mirror of _verifyRecordingStarted — poll the result
+            // endpoint for ~30s. If status==='error', toast it. If done,
+            // toast success. Else warn after timeout.
+            var attempts = 0;
+            var maxAttempts = 30;
+            var iv = setInterval(function () {
+                attempts++;
+                if (attempts >= maxAttempts) {
+                    clearInterval(iv);
+                    showToast('Processing is still starting — check the scan workspace.', 'warn');
+                    loadAll();
+                    return;
+                }
+                fetchJson('GET',
+                    '/api/project/' + encodeURIComponent(_scanId) + '/scan/'
+                    + encodeURIComponent(_scanName) + '/result'
+                ).then(function (r) {
+                    if (!r) return;
+                    if (r.status === 'error') {
+                        clearInterval(iv);
+                        showToast('Processing failed: ' + (r.error || 'unknown error'), 'error');
+                        loadAll();
+                        return;
+                    }
+                    if (r.status === 'done' || r.done === true) {
+                        clearInterval(iv);
+                        showToast('✓ Processing complete', 'success');
+                        loadAll();
+                    }
+                }).catch(function () { /* keep polling */ });
+            }, 1000);
+            state.pollTimers.procVerify = iv;
         }
 
         function confirmReRecord() {
@@ -1878,9 +2017,80 @@
 
         loadAll();
 
-        function onSseTick() { renderAll(); }
+        // Track processing-to-done transitions so we can refresh /result
+        // and auto-navigate to the review screen the moment Modal finishes.
+        // Without this, the workspace stays on "processing — querying..."
+        // until the user manually reloads, even though the bag is done.
+        var sawProcessing = false;
+        var navigatedToReview = false;
+
+        function onSseTick() {
+            renderAll();
+            // Heuristic: was a processing entry visible last tick?
+            var sse = state.lastSse || {};
+            var procMap = sse.processing || {};
+            var stillProcessing = false;
+            for (var sid in procMap) {
+                if (Object.prototype.hasOwnProperty.call(procMap, sid)) {
+                    stillProcessing = true;
+                    break;
+                }
+            }
+            if (sawProcessing && !stillProcessing && !navigatedToReview) {
+                // Transition processing → done. Re-fetch /result so we know
+                // the actual outcome (could be done OR error).
+                fetchJson('GET',
+                    '/api/project/' + encodeURIComponent(scanId) + '/scan/'
+                    + encodeURIComponent(scanName) + '/result'
+                ).then(function (rj) {
+                    lastResult = rj || null;
+                    renderAll();
+                    if (rj && rj.status === 'done' && !navigatedToReview) {
+                        navigatedToReview = true;  // single-shot
+                        showToast('Processing complete — opening review',
+                            'success');
+                        setTimeout(function () {
+                            location.hash = '#/project/'
+                                + encodeURIComponent(scanId)
+                                + '/scan/' + encodeURIComponent(scanName)
+                                + '/review';
+                        }, 600);
+                    }
+                }).catch(function () { /* keep current view */ });
+            }
+            sawProcessing = stillProcessing;
+        }
         window.addEventListener('sse-tick', onSseTick);
         screen._sseHandler = onSseTick;
+
+        // Polling fallback: SSE can stall on Chromium kiosk (EventSource
+        // sometimes silently drops, especially over the lifecycle of a
+        // single tab). Poll /api/status every 1 s and synthesise an
+        // SSE-shaped payload into `state.lastSse`, then re-render. The
+        // SSE listener still wins when it ticks (its updates are richer —
+        // includes `processing[]`); this is a strict safety net so the
+        // Stop button + status label can never get stuck on stale data.
+        state.pollTimers.scanStatus = setInterval(function () {
+            fetchJson('GET', '/api/status', null, { skipAuthRedirect: true })
+                .then(function (s) {
+                    if (!s) return;
+                    var prev = state.lastSse || {};
+                    state.lastSse = {
+                        recording: !!s.recording,
+                        in_flight: !!(s.in_flight || s.recording),
+                        elapsed: s.elapsed || 0,
+                        status: s.inflight_status
+                            || (s.recording ? 'recording' : (prev.status || 'idle')),
+                        session_id: s.active_session || prev.session_id || null,
+                        // /api/status now mirrors the SSE processing snapshot
+                        // so `elapsed` keeps ticking + `stage` updates even
+                        // when EventSource drops on Chromium kiosk.
+                        processing: s.processing || prev.processing || {},
+                    };
+                    renderAll();
+                })
+                .catch(function () { /* keep polling */ });
+        }, 1000);
 
         return screen;
     }
@@ -2757,7 +2967,7 @@
     function _renderReviewFloorplanSvg(result, reviewMap, opts) {
         opts = opts || {};
         var fp = (result && result.floorplan) || {};
-        var walls = fp.walls || [];
+        var rawWalls = fp.walls || [];
         var doors = fp.doors || [];
         var windows = fp.windows || [];
         var furniture = (result && result.furniture) || [];
@@ -2765,10 +2975,40 @@
 
         var svgNs = 'http://www.w3.org/2000/svg';
 
+        // Hygiene filter: SpatialLM occasionally emits zero-length wall
+        // duplicates (109 walls but 108 collapsed to a single point — see
+        // scan_2 / project 48). Drop those so the renderer doesn't stack
+        // labels on top of each other and the auto-scale doesn't collapse
+        // the room to nothing. Also de-duplicate walls whose endpoints
+        // round to the same (cm-precision) line segment.
+        var walls = [];
+        var seen = {};
+        for (var wi = 0; wi < rawWalls.length; wi++) {
+            var rw = rawWalls[wi];
+            if (!rw || !rw.start || !rw.end) continue;
+            var sx = rw.start[0], sy = rw.start[1];
+            var ex = rw.end[0], ey = rw.end[1];
+            var rlen = Math.hypot(ex - sx, ey - sy);
+            if (rlen < 0.1) continue;  // stub / degenerate
+            // Canonical key: sorted endpoints rounded to 1 cm.
+            var ka = [sx.toFixed(2), sy.toFixed(2)].join(',');
+            var kb = [ex.toFixed(2), ey.toFixed(2)].join(',');
+            var key = ka < kb ? (ka + '|' + kb) : (kb + '|' + ka);
+            if (seen[key]) continue;
+            seen[key] = true;
+            walls.push(rw);
+        }
+
         if (!walls.length) {
+            var hint = (rawWalls.length > 0)
+                ? 'The model returned ' + rawWalls.length
+                  + ' wall entries but none had valid geometry. '
+                  + 'Re-record this scan with a longer walk-around.'
+                : 'No walls returned. Re-record with a longer walk-around.';
             var empty = el('div', { class: 'empty-state' }, [
                 el('div', { class: 'empty-state__label' },
-                    'No walls in this run'),
+                    'No usable walls in this run'),
+                el('div', { class: 'empty-state__hint' }, hint),
             ]);
             return empty;
         }
@@ -2787,7 +3027,11 @@
                 if (p[1] > maxY) maxY = p[1];
             }
         }
-        var pad = 0.5;
+        // Padding scales with room size — 4% of the longer dimension, clamped
+        // to [0.25 m, 0.8 m]. A small 3 m room gets ~0.25 m breathing room
+        // (8% of room) instead of a fixed 0.5 m which would dominate it.
+        var roomLongest = Math.max(maxX - minX, maxY - minY);
+        var pad = Math.min(0.8, Math.max(0.25, roomLongest * 0.04));
         minX -= pad; minY -= pad; maxX += pad; maxY += pad;
         var ww = maxX - minX;
         var hh = maxY - minY;
@@ -2796,6 +3040,48 @@
         svg.setAttribute('class', 'review-floorplan-svg');
         svg.setAttribute('viewBox', minX + ' ' + (-maxY) + ' ' + ww + ' ' + hh);
         svg.setAttribute('preserveAspectRatio', 'xMidYMid meet');
+
+        // Variable pixel size: bound the floorplan so a small room renders
+        // small but always readable, a typical room renders at natural
+        // scale, and a huge room is scaled down to fit. On the 640×480
+        // touchscreen with the review-section column ~608 px wide and
+        // ~320 px vertical budget:
+        //
+        //   PX_PER_METRE   natural pixel scale (a 5 m wall ≈ 200 px)
+        //   MIN_W / MIN_H  always at least this big — small rooms / partial
+        //                  detections still produce a usable diagram.
+        //   COL_W_CAP / COL_H_CAP   never bigger than the column.
+        //
+        // Aspect is preserved on both up- and down-scale.
+        var PX_PER_METRE = 40;
+        var COL_W_CAP = 608;
+        var COL_H_CAP = 320;
+        var MIN_W = 280;
+        var MIN_H = 200;
+        var natW = ww * PX_PER_METRE;
+        var natH = hh * PX_PER_METRE;
+        // Scale up if both dimensions are below the floor.
+        if (natW < MIN_W && natH < MIN_H) {
+            var kup = Math.min(MIN_W / natW, MIN_H / natH);
+            natW *= kup; natH *= kup;
+        }
+        // Scale down if either dimension exceeds the cap.
+        if (natW > COL_W_CAP || natH > COL_H_CAP) {
+            var kdn = Math.min(COL_W_CAP / natW, COL_H_CAP / natH);
+            natW *= kdn; natH *= kdn;
+        }
+        svg.setAttribute('width', String(Math.round(natW)));
+        svg.setAttribute('height', String(Math.round(natH)));
+
+        // Background tap = clear all selections. Rect click handlers call
+        // `stopPropagation()`, so any click that bubbles up to the SVG
+        // came from a non-furniture surface (canvas background, walls,
+        // doors, windows) — fire the deselect.
+        if (typeof opts.onCanvasTap === 'function') {
+            svg.addEventListener('click', function (_e) {
+                opts.onCanvasTap();
+            });
+        }
 
         var flipG = document.createElementNS(svgNs, 'g');
         flipG.setAttribute('transform', 'scale(1,-1)');
@@ -2812,7 +3098,10 @@
             return { dx: dx / len, dy: dy / len, len: len };
         }
 
-        // Walls.
+        // Walls + length labels.
+        // Font size is in world units (metres). 0.16 m world ≈ 18-22 px on
+        // a 480-tall screen with a 6-9 m room — readable but not shouty.
+        var WALL_FONT = 0.16;
         for (var w0 = 0; w0 < walls.length; w0++) {
             var wl = walls[w0];
             var line = document.createElementNS(svgNs, 'line');
@@ -2823,6 +3112,26 @@
             line.setAttribute('class', 'review-wall');
             line.setAttribute('stroke-width', '0.05');
             flipG.appendChild(line);
+
+            // Length label: midpoint of wall, offset perpendicular outward.
+            var dirW = wallDir(wl);
+            if (dirW.len < 0.3) continue;  // skip stub walls (door jambs etc.)
+            var mxw = (wl.start[0] + wl.end[0]) / 2;
+            var myw = (wl.start[1] + wl.end[1]) / 2;
+            // Perpendicular: rotate dir 90°. Push label 0.18 m away from wall.
+            var nx = -dirW.dy * 0.18;
+            var ny = dirW.dx * 0.18;
+            var lblText = document.createElementNS(svgNs, 'text');
+            lblText.setAttribute('x', mxw + nx);
+            // Outer SVG group is NOT flipped (we render labels on the
+            // post-flip surface). Negate y to compensate.
+            lblText.setAttribute('y', -(myw + ny));
+            lblText.setAttribute('text-anchor', 'middle');
+            lblText.setAttribute('dominant-baseline', 'central');
+            lblText.setAttribute('class', 'review-wall-len');
+            lblText.setAttribute('font-size', WALL_FONT);
+            lblText.textContent = dirW.len.toFixed(1) + ' m';
+            svg.appendChild(lblText);
         }
 
         // Doors.
@@ -2863,6 +3172,14 @@
 
         // Furniture rects with review-state styling.
         var selectedSet = opts.selectedSet || {};
+        // Index furniture by id so a merged primary can pull its members'
+        // geometries on-the-fly to render the AABB union live (without
+        // waiting for `render_reviewed`).
+        var furnIndex = {};
+        for (var fi0 = 0; fi0 < furniture.length; fi0++) {
+            var ff = furniture[fi0];
+            if (ff && ff.id) furnIndex[ff.id] = ff;
+        }
         for (var f0 = 0; f0 < furniture.length; f0++) {
             (function (f) {
                 if (!f || !f.id) return;
@@ -2870,11 +3187,52 @@
                 var status = entry.status || 'untouched';
                 if (status === 'merged_into') return;  // hidden — collapsed
 
-                var fcx = (f.center && f.center[0]) || 0;
-                var fcy = (f.center && f.center[1]) || 0;
-                var sx = (f.size && f.size[0]) || 0.3;
-                var sy = (f.size && f.size[1]) || 0.3;
+                // For a merged primary, compute the AABB union of
+                // primary + all members so the rect actually grows to
+                // cover all merged sofas / chairs / etc. Yaw stays
+                // verbatim from the primary (plan §6c step 4).
+                var members = entry.merged_from;
+                var isMergedPrimary = (status === 'kept'
+                    && Array.isArray(members) && members.length > 0);
+
+                var fcx, fcy, sx, sy;
                 var yawRad = f.yaw || 0;
+                if (isMergedPrimary) {
+                    // World-axis-aligned union — same math as
+                    // review._merge_geometry server-side.
+                    var lo = [Infinity, Infinity];
+                    var hi = [-Infinity, -Infinity];
+                    var allBoxes = [f];
+                    for (var mi = 0; mi < members.length; mi++) {
+                        var m = furnIndex[members[mi]];
+                        if (m) allBoxes.push(m);
+                    }
+                    for (var bi = 0; bi < allBoxes.length; bi++) {
+                        var b = allBoxes[bi];
+                        var bcx = (b.center && b.center[0]) || 0;
+                        var bcy = (b.center && b.center[1]) || 0;
+                        var bsx = (b.size && b.size[0]) || 0.3;
+                        var bsy = (b.size && b.size[1]) || 0.3;
+                        if (bcx - bsx / 2 < lo[0]) lo[0] = bcx - bsx / 2;
+                        if (bcy - bsy / 2 < lo[1]) lo[1] = bcy - bsy / 2;
+                        if (bcx + bsx / 2 > hi[0]) hi[0] = bcx + bsx / 2;
+                        if (bcy + bsy / 2 > hi[1]) hi[1] = bcy + bsy / 2;
+                    }
+                    fcx = (lo[0] + hi[0]) / 2;
+                    fcy = (lo[1] + hi[1]) / 2;
+                    sx = hi[0] - lo[0];
+                    sy = hi[1] - lo[1];
+                    // Render the union AXIS-ALIGNED (yaw = 0) so the
+                    // visible rect actually contains all members. Server
+                    // keeps the primary's yaw on submit for forward-compat,
+                    // but the visual representation is clearer this way.
+                    yawRad = 0;
+                } else {
+                    fcx = (f.center && f.center[0]) || 0;
+                    fcy = (f.center && f.center[1]) || 0;
+                    sx = (f.size && f.size[0]) || 0.3;
+                    sy = (f.size && f.size[1]) || 0.3;
+                }
                 var yawDeg = yawRad * 180 / Math.PI;
 
                 var rect = document.createElementNS(svgNs, 'rect');
@@ -2889,9 +3247,8 @@
                 else if (status === 'kept') cls += ' is-kept';
                 else cls += ' is-untouched';
 
-                var members = entry.merged_from;
-                var isMergedPrimary = (status === 'kept'
-                    && Array.isArray(members) && members.length > 0);
+                // members + isMergedPrimary already computed above for
+                // the AABB-union geometry calculation. Don't redeclare.
                 if (isMergedPrimary) cls += ' is-merged';
                 if (selectedSet[f.id]) cls += ' is-selected';
 
@@ -2905,11 +3262,61 @@
                     'translate(' + fcx + ' ' + fcy + ') rotate(' + yawDeg + ')');
 
                 if (typeof opts.onTap === 'function') {
-                    rect.addEventListener('click', function () {
+                    rect.addEventListener('click', function (e) {
+                        // Don't bubble to the SVG — that handler clears
+                        // the selection when the user taps blank canvas.
+                        e.stopPropagation();
                         opts.onTap(f.id);
                     });
                 }
                 flipG.appendChild(rect);
+
+                // Class label on top of the rect, sized + rotated to fit.
+                if (status !== 'deleted') {
+                    var cname = (entry.class_override
+                        || (f.class || '')).toString();
+                    // Read along the LONGER side: if depth > width, rotate
+                    // the label 90° so it lays along the longer dimension
+                    // and we can fit more characters before truncating.
+                    var alongY = sy > sx;
+                    var longSide = alongY ? sy : sx;
+                    var shortSide = alongY ? sx : sy;
+                    // Font size: scale to short side (height) — this is the
+                    // SVG line-height bound. Floor at 0.10 m (≈ 12 px) so
+                    // tiny bboxes still get readable text.
+                    var fontSz = Math.max(0.10, shortSide * 0.36);
+                    // Char budget on the long side — assume ~0.55 m per
+                    // 1 m of fontSize for our font weight.
+                    var charBudget = Math.max(4,
+                        Math.floor(longSide / (fontSz * 0.55)));
+                    var displayName = cname.length > charBudget
+                        ? cname.slice(0, Math.max(1, charBudget - 1)) + '…'
+                        : cname;
+                    if (displayName) {
+                        var lbl = document.createElementNS(svgNs, 'text');
+                        lbl.setAttribute('x', '0');
+                        lbl.setAttribute('y', '0');
+                        lbl.setAttribute('text-anchor', 'middle');
+                        lbl.setAttribute('dominant-baseline', 'central');
+                        lbl.setAttribute('class', 'review-furn-label');
+                        lbl.setAttribute('font-size', fontSz);
+                        lbl.textContent = displayName;
+                        lbl.setAttribute('pointer-events', 'none');
+
+                        // Wrap in a <g> so we can: (1) translate to the
+                        // rect's centre in the un-flipped outer SVG space
+                        // (negate y), and (2) rotate -90° when the rect
+                        // is taller than it is wide.
+                        var lblG = document.createElementNS(svgNs, 'g');
+                        var tx = fcx, ty = -fcy;
+                        var transform = 'translate(' + tx + ' ' + ty + ')';
+                        if (alongY) transform += ' rotate(-90)';
+                        lblG.setAttribute('transform', transform);
+                        lblG.setAttribute('pointer-events', 'none');
+                        lblG.appendChild(lbl);
+                        svg.appendChild(lblG);
+                    }
+                }
 
                 // Merged-primary badge: `↻N` (member count + 1).
                 if (isMergedPrimary) {
@@ -3015,7 +3422,7 @@
             runId: null,
             runs: [],
             taxonomy: null,       // /api/taxonomy/classes
-            activeTab: 'furniture',
+            activeTab: 'floorplan',
             selected: {},         // { bbox_id: true }
             cacheBust: {},        // { bbox_id: ts }
             // pulse target id when cross-tab navigating
@@ -3088,27 +3495,14 @@
 
             var reviewedAt = ctx.review && ctx.review.reviewed_at;
 
-            var tabs = el('div', { class: 'review-tabs', role: 'tablist' }, [
-                el('button', {
-                    class: 'review-tab__btn',
-                    'data-tab': 'floorplan', type: 'button', role: 'tab',
-                    on: { click: function () { _setReviewTab(screen, 'floorplan'); ctx.activeTab = 'floorplan'; renderBody(); } },
-                }, 'Floorplan'),
-                el('button', {
-                    class: 'review-tab__btn',
-                    'data-tab': 'furniture', type: 'button', role: 'tab',
-                    on: { click: function () { _setReviewTab(screen, 'furniture'); ctx.activeTab = 'furniture'; renderBody(); } },
-                }, [
-                    el('span', null, 'Furniture'),
-                    el('span', { class: 'review-tab__count' },
-                        '(' + furnCount + ')'),
-                ]),
-                el('button', {
-                    class: 'review-tab__btn',
-                    'data-tab': 'notes', type: 'button', role: 'tab',
-                    on: { click: function () { _setReviewTab(screen, 'notes'); ctx.activeTab = 'notes'; renderBody(); } },
-                }, 'Notes'),
-            ]);
+            // Single-page review (no tabs): floorplan, then furniture
+            // cards, then notes — all stacked vertically in one scroll.
+            // The ctx.activeTab value persists for legacy code paths
+            // (sticky bar / floorplan-tap pulse) but every "switch tab"
+            // call now is a no-op visual.
+            var tabs = el('div',
+                { class: 'review-section-summary' },
+                'Furniture: ' + furnCount);
 
             var runPill = el('button', {
                 class: 'review-run-pill', type: 'button',
@@ -3645,13 +4039,89 @@
             document.body.appendChild(overlay);
         }
 
-        // ---- find-product modal ----
+        // ---- find-product: prefetch + cache + modal -----------------
+        //
+        // Strategy: when the review screen first loads `result.json`, we
+        // queue every bbox for a background visual-search prefetch (with
+        // small concurrency so we don't melt the Athathi server). Each
+        // result lands in `ctx.findProductCache[bboxId]` AND the backend's
+        // sha1-keyed disk cache. When the user taps "Find product", the
+        // modal reads from `ctx.findProductCache` first — instant render.
+        //
+        // The prefetch is governed by `config.visual_search_prefetch`
+        // (default true). Set to false in Settings to disable (for slow
+        // links / metered connections).
+
+        ctx.findProductCache = ctx.findProductCache || {};
+        ctx.findProductPrefetchQueue = [];
+        ctx.findProductPrefetchActive = 0;
+        var FP_PREFETCH_CONCURRENCY = 2;
+
+        function _fpPrefetchNext() {
+            if (ctx.findProductPrefetchActive >= FP_PREFETCH_CONCURRENCY) return;
+            var job = ctx.findProductPrefetchQueue.shift();
+            if (!job) return;
+            ctx.findProductPrefetchActive++;
+            fetchJson('POST', reviewBaseUrl() + '/review/find_product/' + job.idx,
+                null, { skipAuthRedirect: true })
+                .then(function (data) {
+                    ctx.findProductCache[job.bboxId] = data || { results: [] };
+                })
+                .catch(function () {
+                    // Quiet — modal will retry on demand.
+                })
+                .then(function () {
+                    ctx.findProductPrefetchActive--;
+                    _fpPrefetchNext();
+                });
+            _fpPrefetchNext();  // fill the second concurrency slot
+        }
+
+        function _fpKickoffPrefetch() {
+            // Default: prefetch on. Disable only when state.config exists
+            // AND explicitly says false. This means the review screen
+            // doesn't have to wait for /api/settings/config to load.
+            if (state.config
+                    && state.config.visual_search_prefetch === false) {
+                return;
+            }
+            var bbis = (ctx.result && ctx.result.best_images) || [];
+            var seenInQueue = {};
+            for (var i = 0; i < bbis.length; i++) {
+                var b = bbis[i];
+                if (!b || !b.bbox_id) continue;
+                if (ctx.findProductCache[b.bbox_id]) continue;
+                if (seenInQueue[b.bbox_id]) continue;
+                seenInQueue[b.bbox_id] = true;
+                ctx.findProductPrefetchQueue.push({
+                    bboxId: b.bbox_id, idx: i,
+                });
+            }
+            for (var c = 0; c < FP_PREFETCH_CONCURRENCY; c++) _fpPrefetchNext();
+        }
+        // Kick off once result data is on hand AND state.config has been
+        // loaded. Called from the Promise.all in loadAll() AFTER ctx.result
+        // is populated (registered via `ctx.onResultLoaded` so we don't
+        // need to thread it through closures).
+        function _fpEnsureConfigLoaded() {
+            if (state.config) return Promise.resolve();
+            return fetchJson('GET', '/api/settings/config', null,
+                { skipAuthRedirect: true })
+                .then(function (cfg) { state.config = cfg || {}; })
+                .catch(function () { /* leave undefined → defaults kick in */ });
+        }
+        ctx.onResultLoaded = function () {
+            if (!ctx.result) return;
+            _fpEnsureConfigLoaded().then(_fpKickoffPrefetch);
+        };
+
+        function _fpTopK() {
+            var k = state.config && state.config.visual_search_top_k;
+            return (typeof k === 'number' && k > 0) ? k : 6;
+        }
+
         function openFindProductModal(bboxId) {
             var bodyHostL = el('div', { class: 'find-product__body' });
-            bodyHostL.appendChild(el('div', { class: 'loading-row' }, [
-                el('span', { class: 'spinner' }),
-                el('span', null, 'Searching…'),
-            ]));
 
             var noMatchBtn = el('button', {
                 class: 'btn-secondary btn-lg', type: 'button',
@@ -3681,27 +4151,45 @@
                 ]));
                 return;
             }
+
+            function renderResults(data) {
+                bodyHostL.innerHTML = '';
+                var results = (data && data.results) || [];
+                var topK = _fpTopK();
+                results = results.slice(0, topK);
+                if (!results.length) {
+                    bodyHostL.appendChild(el('div', { class: 'empty-state' }, [
+                        el('div', { class: 'empty-state__label' },
+                            'No matches'),
+                    ]));
+                    return;
+                }
+                var grid = el('div', { class: 'find-product__grid' });
+                for (var i = 0; i < results.length; i++) {
+                    grid.appendChild(buildProductCandidate(bboxId, results[i]));
+                }
+                bodyHostL.appendChild(grid);
+            }
+
+            // Cache hit — render synchronously, no spinner.
+            if (ctx.findProductCache[bboxId]) {
+                renderResults(ctx.findProductCache[bboxId]);
+                return;
+            }
+
+            // Cache miss — show spinner, fetch, cache, render.
+            bodyHostL.appendChild(el('div', { class: 'loading-row' }, [
+                el('span', { class: 'spinner' }),
+                el('span', null, 'Searching…'),
+            ]));
             fetchJson('POST', reviewBaseUrl() + '/review/find_product/' + idx)
                 .then(function (data) {
+                    ctx.findProductCache[bboxId] = data || { results: [] };
+                    renderResults(data);
+                })
+                .catch(function (e) {
                     bodyHostL.innerHTML = '';
-                    var results = (data && data.results) || [];
-                    if (!results.length) {
-                        bodyHostL.appendChild(el('div',
-                            { class: 'empty-state' }, [
-                            el('div', { class: 'empty-state__label' },
-                                'No matches'),
-                        ]));
-                        return;
-                    }
-                    var list = el('div', { class: 'find-product__list' });
-                    for (var i = 0; i < results.length; i++) {
-                        list.appendChild(buildProductCandidate(bboxId, results[i]));
-                    }
-                    bodyHostL.appendChild(list);
-                }).catch(function (e) {
-                    bodyHostL.innerHTML = '';
-                    bodyHostL.appendChild(el('div',
-                        { class: 'empty-state' }, [
+                    bodyHostL.appendChild(el('div', { class: 'empty-state' }, [
                         el('div', { class: 'empty-state__label' },
                             'Search failed'),
                         el('div', { class: 'empty-state__hint' },
@@ -3985,18 +4473,20 @@
             var svg = _renderReviewFloorplanSvg(ctx.result, reviewMap(), {
                 selectedSet: ctx.selected,
                 onTap: function (bboxId) {
+                    if (ctx.selected[bboxId]) {
+                        delete ctx.selected[bboxId];
+                    } else {
+                        ctx.selected[bboxId] = true;
+                    }
                     ctx.pulseFurnitureBboxId = bboxId;
-                    ctx.activeTab = 'furniture';
-                    _setReviewTab(screen, 'furniture');
                     renderBody();
-                    setTimeout(function () {
-                        var card = document.getElementById(
-                            'review-card-' + bboxId);
-                        if (card && card.scrollIntoView) {
-                            card.scrollIntoView(
-                                { behavior: 'smooth', block: 'center' });
-                        }
-                    }, 60);
+                },
+                onCanvasTap: function () {
+                    // Tap on blank canvas (no rect under finger) — clear
+                    // any selection so the technician can start fresh.
+                    if (Object.keys(ctx.selected).length === 0) return;
+                    ctx.selected = {};
+                    renderBody();
                 },
             });
             host.appendChild(el('div', { class: 'review-floorplan-wrap' }, svg));
@@ -4053,18 +4543,12 @@
             host.appendChild(el('div', { class: 'review-mark-host' }, [btn]));
         }
 
-        // ---- body switch ----
+        // ---- body: single-scroll layout (floorplan → furniture → notes) ----
         function renderBody() {
             bodyHost.innerHTML = '';
-            var floorpHost = el('div', {
-                class: 'review-tab__body', 'data-tab': 'floorplan',
-            });
-            var furnHost = el('div', {
-                class: 'review-tab__body', 'data-tab': 'furniture',
-            });
-            var notesHost = el('div', {
-                class: 'review-tab__body', 'data-tab': 'notes',
-            });
+            var floorpHost = el('div', { class: 'review-section' });
+            var furnHost = el('div', { class: 'review-section' });
+            var notesHost = el('div', { class: 'review-section' });
             renderFloorplanTab(floorpHost);
             renderFurnitureTab(furnHost);
             renderNotesTab(notesHost);
@@ -4072,9 +4556,7 @@
             bodyHost.appendChild(furnHost);
             bodyHost.appendChild(notesHost);
 
-            // Mark-reviewed footer (every tab).
             renderMarkReviewed(bodyHost);
-            _setReviewTab(screen, ctx.activeTab);
             renderStickyBar();
         }
 
@@ -4103,6 +4585,11 @@
                 renderHeader();
                 renderStaleBanner();
                 renderBody();
+                // Fire the visual-search prefetch the moment result data
+                // is on hand — see `_fpKickoffPrefetch` for the queue.
+                if (typeof ctx.onResultLoaded === 'function') {
+                    ctx.onResultLoaded();
+                }
             }).catch(function (e) {
                 bodyHost.innerHTML = '';
                 bodyHost.appendChild(el('div', { class: 'empty-state' }, [
@@ -4299,6 +4786,25 @@
             var root = el('div', { id: 'app-root' });
             document.body.insertBefore(root, document.body.firstChild);
         }
+
+        // JS-1: OSK awareness — when an editable element gains focus, mark
+        // body.osk-open so CSS can lift the toast above the keyboard and
+        // hide the sticky multi-select bar. Scroll the field into view.
+        document.addEventListener('focusin', function (e) {
+            var t = e.target;
+            if (t && t.matches && t.matches('input,textarea,select')) {
+                document.body.classList.add('osk-open');
+                try { t.scrollIntoView({ block: 'center', behavior: 'smooth' }); } catch (_) { /* ignore */ }
+            }
+        });
+        document.addEventListener('focusout', function () {
+            setTimeout(function () {
+                var a = document.activeElement;
+                if (!a || !a.matches || !a.matches('input,textarea,select')) {
+                    document.body.classList.remove('osk-open');
+                }
+            }, 200);
+        });
 
         window.addEventListener('hashchange', navigate);
 
