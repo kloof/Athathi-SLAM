@@ -1,0 +1,8 @@
+{
+  "api_url": "http://116.203.199.113:8002",
+  "upload_endpoint": "http://116.203.199.113:8002",
+  "last_user": "",
+  "post_submit_hook": null,
+  "image_transport": "multipart",
+  "visual_search_cache_ttl_s": 86400
+}
