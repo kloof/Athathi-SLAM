@@ -154,7 +154,7 @@ def _is_recording():
         with _record_lock:
             if _active_recording['bag_proc'] is proc:
                 _kill_process_group(_active_recording.get('driver_proc'))
-                _kill_process_group(_active_recording.get('camera_proc'))
+                _kill_process_group(_active_recording.get('camera_proc'), timeout=10)
                 _kill_process_group(_active_recording.get('tf_proc'))
                 _kill_process_group(_active_recording.get('camera_monitor_proc'))
                 # Update session status so it doesn't stay stuck as 'recording'
@@ -318,11 +318,12 @@ _CAMERA_STDERR_LOG = '/tmp/slam_camera_stderr.log'
 
 
 def _release_camera_device(timeout=3.0):
-    """Kill the preview ffmpeg (if any) and wait for /dev/video0 to be free.
+    """Make CAMERA_DEVICE openable before a new scan claims it.
 
-    The preview holds /dev/video0 while streaming; without this, v4l2_camera_node
-    races and loses ("Device or resource busy"), producing a zombie process and
-    no topics. Must run before _launch_camera().
+    Steps in order: (1) terminate the tracked preview ffmpeg, (2) poll up to
+    `timeout` seconds for the device to go free, (3) if still busy, `fuser
+    -k -9` any holders (orphan ffmpeg from a prior scan whose cleanup was
+    interrupted) and re-poll once. Must run before _launch_camera().
     """
     preview = _active_preview.get('proc')
     if preview is not None:
@@ -346,7 +347,37 @@ def _release_camera_device(timeout=3.0):
             return True
         except OSError:
             time.sleep(0.1)
-    return False
+
+    # Still busy — log who's holding it, then fuser -k -9. On this Pi only
+    # our own camera pipeline uses the Brio, so this only hits orphans.
+    _log(f'_release_camera_device: {CAMERA_DEVICE} still busy after {timeout}s')
+    try:
+        # fuser -v writes a human-readable "process holding file" list to stderr.
+        result = subprocess.run(
+            ['fuser', '-v', CAMERA_DEVICE],
+            capture_output=True, timeout=2, text=True,
+        )
+        holders = (result.stderr or result.stdout or '').strip()
+        if holders:
+            _log(f'_release_camera_device: holders of {CAMERA_DEVICE}:\n{holders}')
+    except Exception as e:
+        _log(f'_release_camera_device: fuser -v failed: {e}')
+    _log(f'_release_camera_device: invoking fuser -k -9 {CAMERA_DEVICE}')
+    try:
+        subprocess.run(
+            ['fuser', '-k', '-9', CAMERA_DEVICE],
+            capture_output=True, timeout=3,
+        )
+    except Exception as e:
+        _log(f'_release_camera_device: fuser -k failed: {e}')
+    # Give the kernel a beat to release the fd after SIGKILL reaps the holder.
+    time.sleep(0.5)
+    try:
+        fd = os.open(CAMERA_DEVICE, os.O_RDWR | os.O_NONBLOCK)
+        os.close(fd)
+        return True
+    except OSError:
+        return False
 
 
 def _launch_camera():
@@ -738,7 +769,7 @@ def _recording_thread(session_id, session_name):
             session['status'] = 'error'
             session['error'] = 'Driver exited during warmup'
             _put_session(session_id, session)
-            _kill_process_group(camera_proc)
+            _kill_process_group(camera_proc, timeout=10)
             _kill_process_group(tf_proc)
             _active_recording['driver_proc'] = None
             _active_recording['camera_proc'] = None
@@ -757,7 +788,7 @@ def _recording_thread(session_id, session_name):
             session['error'] = 'Topics not found after 30s'
             _put_session(session_id, session)
             _kill_process_group(driver_proc)
-            _kill_process_group(camera_proc)
+            _kill_process_group(camera_proc, timeout=10)
             _kill_process_group(tf_proc)
             _active_recording['driver_proc'] = None
             _active_recording['camera_proc'] = None
@@ -789,17 +820,18 @@ def _recording_thread(session_id, session_name):
                     target=_camera_monitor_reader, args=(camera_monitor_proc,),
                     daemon=True,
                 ).start()
-                # Allow up to 10s for the first frame to land. The monitor's FRAMES
-                # counter is only flushed on a 1s rclpy timer, and mjpeg2rgb's
-                # software-decode warm-up on Pi 4 can easily consume several seconds
-                # before first publish -- 3s was too tight.
-                deadline = time.time() + 10.0
+                # Allow up to 20s for the first frame. Must cover the recovery
+                # path: if the first ffmpeg session inside camera_node fails
+                # (device busy), camera_node runs a USB unbind/rebind (~5–10s)
+                # and restarts ffmpeg (probe adds ~3s) before the first publish.
+                # 10s was too tight and caused "recording without camera".
+                deadline = time.time() + 20.0
                 while time.time() < deadline:
                     if _active_recording['camera_frames'] > 0:
                         break
                     time.sleep(0.1)
                 if _active_recording['camera_frames'] == 0:
-                    _log('WARNING: No camera frames received in 10s — recording without camera')
+                    _log('WARNING: No camera frames received in 20s — recording without camera')
                     _kill_process_group(camera_monitor_proc)
                     _active_recording['camera_monitor_proc'] = None
                     camera_monitor_proc = None
@@ -836,7 +868,7 @@ def _recording_thread(session_id, session_name):
             session['error'] = str(e)
             _put_session(session_id, session)
         _kill_process_group(driver_proc)
-        _kill_process_group(camera_proc)
+        _kill_process_group(camera_proc, timeout=10)
         _kill_process_group(tf_proc)
         _kill_process_group(_active_recording.get('camera_monitor_proc'))
         _active_recording['driver_proc'] = None
@@ -872,10 +904,13 @@ def api_record_stop():
         # A premature SIGKILL here corrupts the bag (missing index, 0-byte metadata).
         _kill_process_group(bag_proc, timeout=30)
 
-        # Stop driver, camera, and the camera monitor subscriber
+        # Stop driver, camera, and the camera monitor subscriber.
+        # camera_proc gets 10s to run its finally block (ffmpeg cleanup +
+        # rclpy shutdown). A shorter grace lets SIGKILL hit before cleanup,
+        # which can leave ffmpeg orphaned holding /dev/video0.
         camera_monitor_proc = _active_recording.get('camera_monitor_proc')
         _kill_process_group(driver_proc)
-        _kill_process_group(camera_proc)
+        _kill_process_group(camera_proc, timeout=10)
         _kill_process_group(tf_proc)
         _kill_process_group(camera_monitor_proc)
 
@@ -1876,7 +1911,7 @@ def _cleanup_on_exit():
     """Kill any running driver/bag/camera processes on app shutdown."""
     _kill_process_group(_active_recording.get('bag_proc'))
     _kill_process_group(_active_recording.get('driver_proc'))
-    _kill_process_group(_active_recording.get('camera_proc'))
+    _kill_process_group(_active_recording.get('camera_proc'), timeout=10)
     _kill_process_group(_active_recording.get('tf_proc'))
     _kill_process_group(_active_recording.get('camera_monitor_proc'))
     if _active_calibration.get('proc'):

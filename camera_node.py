@@ -23,6 +23,7 @@ import subprocess
 import sys
 import threading
 import time
+import traceback
 import yaml
 
 import rclpy
@@ -45,6 +46,11 @@ FIONREAD = 0x541B
 PIPE_SIZE = 1 << 20       # 1 MB, capped by /proc/sys/fs/pipe-max-size
 READ_CHUNK = 131072       # 128 KB — typically one full 720p MJPG frame
 QUEUE_SIZE = 5            # ~165 ms of buffered frames at 30 fps
+
+# ffmpeg's stderr goes here so post-mortem triage can see the exact failure
+# (e.g. "Device or resource busy", "Cannot allocate memory"). Previously
+# DEVNULL'd, which hid the reason every session failed after an orphan leak.
+FFMPEG_STDERR_LOG = '/tmp/slam_ffmpeg_stderr.log'
 
 
 def load_camera_info(path):
@@ -77,17 +83,45 @@ def find_brio_usb_port():
     return None
 
 
-def reset_brio_usb(logger):
+def reset_brio_usb(logger, stop=None):
     """Unbind and rebind the Brio's USB port to clear a wedged UVC state.
 
-    Typically triggered when ffmpeg reports 'Protocol error' or 'No such
-    device' after a stream interruption. The Brio sometimes lands in a
-    state where v4l2 ioctls fail until the USB stack re-enumerates it.
+    Triggered when ffmpeg reports 'Protocol error' or 'No such device' after
+    a stream interruption. The Brio sometimes lands in a state where v4l2
+    ioctls fail until the USB stack re-enumerates it.
+
+    Hardened: force-kills any process still holding /dev/video* before
+    unbind (a leftover fd causes EBUSY on rebind), and retries the rebind
+    up to 3 times when the kernel reports the port is busy.
+
+    `stop` (threading.Event, optional): if set during sleeps, aborts early
+    and returns False so the caller can shut down promptly.
     """
+    def _sleep(sec):
+        """Interruptible sleep. Returns True if stop was set during the wait."""
+        if stop is not None:
+            return stop.wait(timeout=sec)
+        time.sleep(sec)
+        return False
+
     port = find_brio_usb_port()
     if port is None:
         logger.warn('USB reset: Brio not enumerated, cannot reset')
         return False
+
+    # Force-close any leftover fds on the video node. Without this, rebind
+    # often fails with EBUSY because the kernel refuses to re-probe a port
+    # whose previous interface is still open.
+    dev = find_brio_device()
+    if dev:
+        try:
+            subprocess.run(
+                ['fuser', '-k', '-9', dev],
+                capture_output=True, timeout=3,
+            )
+        except Exception as e:
+            logger.warn(f'USB reset: fuser failed ({e})')
+
     try:
         logger.info(f'USB reset: unbinding {port}')
         with open('/sys/bus/usb/drivers/usb/unbind', 'w') as f:
@@ -95,29 +129,60 @@ def reset_brio_usb(logger):
     except OSError as e:
         logger.warn(f'USB reset: unbind failed ({e})')
         return False
-    time.sleep(3)
-    try:
-        with open('/sys/bus/usb/drivers/usb/bind', 'w') as f:
-            f.write(port)
-        logger.info(f'USB reset: rebound {port}')
-    except OSError as e:
-        logger.warn(f'USB reset: rebind failed ({e})')
+    if _sleep(3):
         return False
-    # Wait for /dev/video* to reappear
+
+    # Rebind with retry-on-EBUSY. Kernel sometimes needs another second
+    # to fully tear down the old interface.
+    rebound = False
+    for attempt in range(3):
+        try:
+            with open('/sys/bus/usb/drivers/usb/bind', 'w') as f:
+                f.write(port)
+            logger.info(f'USB reset: rebound {port} (attempt {attempt + 1})')
+            rebound = True
+            break
+        except OSError as e:
+            # EBUSY (16) is retryable; other errors (e.g. ENODEV 19) are not.
+            if getattr(e, 'errno', None) == 16 and attempt < 2:
+                logger.info('USB reset: rebind EBUSY, retrying in 2s')
+                if _sleep(2):
+                    return False
+                continue
+            logger.warn(f'USB reset: rebind failed ({e})')
+            return False
+    if not rebound:
+        return False
+
+    # Wait for /dev/video* to reappear, then give uvcvideo ~3s to finalize
+    # control negotiation (was 2s; occasionally too short on Pi 4).
     deadline = time.time() + 10.0
     while time.time() < deadline:
+        if stop is not None and stop.is_set():
+            return False
         dev = find_brio_device()
         if dev and os.path.exists(dev):
-            # Give uvcvideo a moment to finalize control negotiation
-            time.sleep(2)
+            if _sleep(3):
+                return False
             return True
-        time.sleep(0.5)
+        if _sleep(0.5):
+            return False
     logger.warn('USB reset: device did not reappear within 10s')
     return False
 
 
 def start_ffmpeg(device):
-    """Launch an ffmpeg MJPG reader piping raw JPEG frames to stdout."""
+    """Launch an ffmpeg MJPG reader piping raw JPEG frames to stdout.
+
+    Deliberately does NOT use setsid — ffmpeg stays in camera_node's pgid so
+    app.py's killpg on the camera process group reaps ffmpeg atomically. A
+    separate pgid previously left ffmpeg orphaned (holding /dev/video0) when
+    Python got SIGKILL'd before its finally block ran.
+    """
+    try:
+        stderr_fh = open(FFMPEG_STDERR_LOG, 'ab')
+    except OSError:
+        stderr_fh = subprocess.DEVNULL
     ffmpeg = subprocess.Popen(
         ['ffmpeg', '-hide_banner', '-loglevel', 'error',
          '-analyzeduration', '3000000', '-probesize', '3000000',
@@ -126,9 +191,12 @@ def start_ffmpeg(device):
          '-framerate', str(CAMERA_FPS_CAPTURE),
          '-i', device,
          '-c:v', 'copy', '-f', 'mjpeg', 'pipe:1'],
-        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-        bufsize=0, preexec_fn=os.setsid,
+        stdout=subprocess.PIPE, stderr=stderr_fh,
+        bufsize=0,
     )
+    # Popen dup'd the fd; we can drop our handle so it closes when ffmpeg exits.
+    if stderr_fh is not subprocess.DEVNULL:
+        stderr_fh.close()
     try:
         fcntl.fcntl(ffmpeg.stdout.fileno(), F_SETPIPE_SZ, PIPE_SIZE)
     except (OSError, AttributeError):
@@ -137,14 +205,19 @@ def start_ffmpeg(device):
 
 
 def kill_ffmpeg(ffmpeg):
+    # Target ffmpeg directly (not killpg) — ffmpeg now shares camera_node's
+    # pgid, so killpg here would signal ourselves.
     try:
-        os.killpg(os.getpgid(ffmpeg.pid), signal.SIGTERM)
+        ffmpeg.terminate()
         ffmpeg.wait(timeout=2)
-    except Exception:
+    except subprocess.TimeoutExpired:
         try:
-            os.killpg(os.getpgid(ffmpeg.pid), signal.SIGKILL)
+            ffmpeg.kill()
+            ffmpeg.wait(timeout=2)
         except Exception:
             pass
+    except Exception:
+        pass
 
 
 def run_session(node, img_pub, info_pub, info, stop, device, logger):
@@ -154,7 +227,14 @@ def run_session(node, img_pub, info_pub, info, stop, device, logger):
     successful session; zero suggests ffmpeg never produced a valid frame
     (caller may trigger a USB reset and retry).
     """
-    lock_camera_controls(device)
+    # v4l2-ctl can hang (TimeoutExpired) when the device is held by an orphan
+    # ffmpeg from the previous scan. Swallow — ffmpeg will retry or the main
+    # loop will trigger a USB reset. Previously this unhandled exception
+    # crashed the whole node, leaving the topic advertised but frame-less.
+    try:
+        lock_camera_controls(device)
+    except Exception as e:
+        logger.warn(f'lock_camera_controls failed: {e} — proceeding unlocked')
     time.sleep(0.5)
 
     ffmpeg = start_ffmpeg(device)
@@ -258,34 +338,53 @@ def main():
     signal.signal(signal.SIGTERM, _sig)
 
     # Session loop: on ffmpeg failure, try USB reset and continue. Limit
-    # consecutive USB resets to prevent thrash if the device is truly gone.
+    # consecutive failures to prevent thrash if the device is truly gone.
+    # Any unexpected exception in the loop is logged and treated as an
+    # empty session so recovery still runs — the node must not crash
+    # while the topic is advertised, since rosbag would silently record no frames.
     consec_resets = 0
     total_frames = 0
+    max_empty = 5  # raised from 3: tolerate USB glitches during long scans
     while not stop.is_set():
-        device = find_brio_device()
-        if device is None:
-            logger.warn('no Brio device found; waiting 2s')
-            time.sleep(2)
-            continue
-        logger.info(f'session start on {device} (total_frames={total_frames})')
-        frames = run_session(node, img_pub, info_pub, info, stop, device, logger)
-        total_frames += frames
-        logger.warn(f'session ended after {frames} frames')
-        if stop.is_set():
-            break
-        # If the session produced many frames before dying, it was a real
-        # USB hiccup — reset + retry. If it produced ~zero, either fresh
-        # enumeration is still settling or something is very wrong;
-        # exponential backoff before giving up.
-        if frames > 30:
-            consec_resets = 0
-        else:
-            consec_resets += 1
-            if consec_resets >= 3:
-                logger.error('3 consecutive empty sessions; giving up')
+        try:
+            device = find_brio_device()
+            if device is None:
+                logger.warn('no Brio device found; waiting 2s')
+                stop.wait(timeout=2)
+                continue
+            logger.info(f'session start on {device} (total_frames={total_frames})')
+            frames = run_session(node, img_pub, info_pub, info, stop, device, logger)
+            total_frames += frames
+            logger.warn(f'session ended after {frames} frames')
+            if stop.is_set():
                 break
-        if not reset_brio_usb(logger):
-            time.sleep(2)
+            # If the session produced many frames before dying, it was a real
+            # USB hiccup — reset + retry. If ~zero, the Brio may be wedged
+            # or /dev/video0 is held by a straggler; count and back off.
+            if frames > 30:
+                consec_resets = 0
+            else:
+                consec_resets += 1
+                if consec_resets >= max_empty:
+                    logger.error(f'{max_empty} consecutive empty sessions; giving up')
+                    break
+            if not reset_brio_usb(logger, stop):
+                stop.wait(timeout=2)
+            # Progressive backoff once we start failing: gives USB re-enumeration
+            # and downstream drivers time to settle. 0/2/4/6/8s cap. stop.wait
+            # so SIGTERM during backoff shuts us down promptly.
+            if consec_resets > 0:
+                stop.wait(timeout=min(consec_resets * 2, 8))
+        except Exception as e:
+            logger.error(
+                f'session loop exception: {type(e).__name__}: {e}\n'
+                f'{traceback.format_exc()}'
+            )
+            consec_resets += 1
+            if consec_resets >= max_empty:
+                logger.error(f'{max_empty} consecutive failures; giving up')
+                break
+            stop.wait(timeout=min(consec_resets * 2, 8))
 
     logger.info(f'shutting down (total_frames={total_frames})')
     node.destroy_node()
