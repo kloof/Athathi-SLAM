@@ -4,3 +4,5 @@ recordings/
 sessions.json
 image.png
 .claude/
+calibration/
+*.mp4

@@ -1,0 +1,17 @@
+calibration_date: '2026-04-11'
+child_frame: camera_optical_frame
+method: manual_visual_alignment
+parent_frame: unilidar_lidar
+rotation:
+  w: 0.2164396139381029
+  x: 0.0
+  y: 0.0
+  z: -0.9762960071199334
+rpy_degrees:
+  pitch: 0.0
+  roll: 0.0
+  yaw: -155.0
+translation:
+  x: 0.015
+  y: 0.095
+  z: 0.07
